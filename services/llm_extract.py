@@ -4,6 +4,10 @@ from openai import OpenAI
 
 from config import settings
 
+client = OpenAI(api_key=settings.OPENAI_API_KEY, timeout=30, max_retries=2)
+
+
+def extract_attributes(name, hint):
 client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 

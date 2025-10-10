@@ -25,6 +25,27 @@ st.title("🎸 Magento Product Enricher")
 if "products" not in st.session_state:
     st.session_state.products = []
 
+if st.button("🔄 Load Eligible Products"):
+    data = client.get_default_products()
+    items = data.get("items", [])
+    eligible = []
+    for product in items:
+        sku = product.get("sku")
+        if not sku:
+            continue
+        try:
+            stock_item = client.get_stock_item(sku)
+        except Exception:
+            continue
+        qty_value = stock_item.get("qty", 0)
+        try:
+            qty = float(qty_value)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty > 1:
+            eligible.append(product)
+    st.session_state.products = eligible
+    st.success(f"Loaded {len(st.session_state.products)} eligible products")
 if st.button("🔄 Load Default Products"):
     data = client.get_default_products()
     st.session_state.products = data.get("items", [])
