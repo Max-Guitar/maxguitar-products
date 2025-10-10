@@ -1,5 +1,8 @@
+"""Streamlit front end for reviewing and enriching Magento catalog data."""
+
 import streamlit as st
 import pandas as pd
+
 from connectors.magento import client
 from services.llm_extract import extract_attributes
 from services.normalize import normalize_value
