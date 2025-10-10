@@ -1,0 +1,6 @@
+bridge_type:
+  fixed: ["hardtail", "fixed", "stop tail"]
+  tremolo: ["tremolo", "vibrato", "whammy"]
+strings:
+  6: ["six", "6", "six-string"]
+  7: ["seven", "7", "seven-string"]
