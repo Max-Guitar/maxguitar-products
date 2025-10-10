@@ -1,3 +1,5 @@
+"""Streamlit front end for reviewing and enriching Magento catalog data."""
+
 import sys
 from pathlib import Path
 
@@ -7,6 +9,9 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+import streamlit as st
+import pandas as pd
 
 from connectors.magento import client
 from services.llm_extract import extract_attributes
@@ -41,6 +46,10 @@ if st.button("🔄 Load Eligible Products"):
             eligible.append(product)
     st.session_state.products = eligible
     st.success(f"Loaded {len(st.session_state.products)} eligible products")
+if st.button("🔄 Load Default Products"):
+    data = client.get_default_products()
+    st.session_state.products = data.get("items", [])
+    st.success(f"Loaded {len(st.session_state.products)} products")
 
 if st.session_state.products:
     df = pd.DataFrame([
