@@ -10,6 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import streamlit as st
+import pandas as pd
+
 from connectors.magento import client
 from services.llm_extract import extract_attributes
 from services.normalize import normalize_value
