@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 """Streamlit front end for reviewing and enriching Magento catalog data."""
 
 import sys
@@ -46,6 +48,19 @@ if st.button("🔄 Load Eligible Products"):
             eligible.append(product)
     st.session_state.products = eligible
     st.success(f"Loaded {len(st.session_state.products)} eligible products")
+
+if st.session_state.products:
+    df = pd.DataFrame(
+        [
+            {
+                "sku": p["sku"],
+                "name": p["name"],
+                "attribute_set_id": p["attribute_set_id"],
+                "created_at": p["created_at"],
+            }
+            for p in st.session_state.products
+        ]
+    )
 if st.button("🔄 Load Default Products"):
     data = client.get_default_products()
     st.session_state.products = data.get("items", [])
@@ -64,6 +79,9 @@ if st.session_state.products:
     if st.button("✨ Generate Specs"):
         results = []
         for sku in selected_skus:
+            product = next(
+                (p for p in st.session_state.products if p["sku"] == sku), None
+            )
             product = next((p for p in st.session_state.products if p["sku"] == sku), None)
             if not product:
                 continue
