@@ -47,64 +47,46 @@ def _stock_qty(product: dict) -> float:
 
 # --- Load products (eligible: qty > 1) ---
 if st.button("🔄 Load Eligible Products (qty > 1)"):
-    st.session_state.products = []
-
     with st.status("Loading products from Magento…", expanded=True) as status:
+        status.write("Requesting product catalog…")
+        data = client.get_default_products()
+        items = data.get("items", [])
+        total_count = data.get("total_count") or len(items)
+
+        eligible = []
         progress = st.progress(0)
-        progress_state = {"pages": None, "count": None}
 
-        def _update_progress(*, page, total_pages, fetched, total_count):
-            if total_pages is not None:
-                progress_state["pages"] = total_pages
-            if total_count is not None:
-                progress_state["count"] = total_count
+        for index, product in enumerate(items, start=1):
+            status.update(
+                label=f"Filtering Magento products ({index}/{total_count or len(items)})",
+                state="running",
+            )
 
-            if progress_state["pages"]:
-                total_pages_known = progress_state["pages"]
-                current = min(page, total_pages_known)
-                progress_ratio = current / max(total_pages_known, 1)
-                progress.progress(int(min(progress_ratio, 1.0) * 100))
-                status.update(
-                    label=f"Fetching Magento products (page {current}/{total_pages_known})",
-                    state="running",
-                )
-            elif progress_state["count"]:
-                total_count_known = progress_state["count"]
-                progress_ratio = fetched / max(total_count_known, 1)
-                progress.progress(int(min(progress_ratio, 1.0) * 100))
-                status.update(
-                    label=f"Fetching Magento products ({fetched}/{total_count_known})",
-                    state="running",
-                )
+            extension_attributes = product.get("extension_attributes") or {}
+            stock_item = extension_attributes.get("stock_item") if isinstance(extension_attributes, dict) else {}
+            if not isinstance(stock_item, dict):
+                stock_item = {}
+
+            try:
+                qty = float(stock_item.get("qty", 0) or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+
+            if qty > 1:
+                eligible.append(product)
+
+            if total_count:
+                progress.progress(int(min(index / total_count, 1.0) * 100))
             else:
-                status.update(
-                    label=f"Fetching Magento products (page {page})",
-                    state="running",
-                )
+                progress.progress(100)
 
-        try:
-            status.write("Requesting product catalog…")
-            data = client.get_default_products(qty_min=None, progress_cb=_update_progress)
-        except Exception as exc:
-            status.update(label="Failed to load Magento products", state="error")
-            st.error(f"Error loading products: {exc}")
-        else:
-            items = data.get("items", [])
-            total_count = data.get("total_count") or len(items)
+        status.update(label="Finished processing Magento catalog", state="complete")
+        st.session_state.products = eligible
 
-            status.update(label="Filtering Magento products by stock…", state="running")
-            eligible = [product for product in items if _stock_qty(product) > 1]
-
-            progress.progress(100)
-            status.update(label="Finished processing Magento catalog", state="complete")
-            st.session_state.products = eligible
-
-            if st.session_state.products:
-                st.success(
-                    f"Loaded {len(st.session_state.products)} eligible products (qty > 1)"
-                )
-            else:
-                st.warning("No products found with quantity greater than 1.")
+    if st.session_state.products:
+        st.success(f"Loaded {len(st.session_state.products)} eligible products (qty > 1)")
+    else:
+        st.warning("No products found with quantity greater than 1.")
 
 # --- Table + selection ---
 if st.session_state.products:
