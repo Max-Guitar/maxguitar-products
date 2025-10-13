@@ -45,48 +45,26 @@ def _stock_qty(product: dict) -> float:
         return 0.0
 
 
-# --- Load products (eligible: qty > 1) ---
-if st.button("🔄 Load Eligible Products (qty > 1)"):
+# --- Load products (filtered by qty > 1 and attribute set "Default") ---
+if st.button("🔄 Load Eligible Products"):
     with st.status("Loading products from Magento…", expanded=True) as status:
-        status.write("Requesting product catalog…")
+        status.write("Requesting product catalog filtered by quantity and attribute set…")
         data = client.get_default_products()
         items = data.get("items", [])
-        total_count = data.get("total_count") or len(items)
 
-        eligible = []
-        progress = st.progress(0)
-
-        for index, product in enumerate(items, start=1):
-            status.update(
-                label=f"Filtering Magento products ({index}/{total_count or len(items)})",
-                state="running",
-            )
-
-            extension_attributes = product.get("extension_attributes") or {}
-            stock_item = extension_attributes.get("stock_item") if isinstance(extension_attributes, dict) else {}
-            if not isinstance(stock_item, dict):
-                stock_item = {}
-
-            try:
-                qty = float(stock_item.get("qty", 0) or 0)
-            except (TypeError, ValueError):
-                qty = 0.0
-
-            if qty > 1:
-                eligible.append(product)
-
-            if total_count:
-                progress.progress(int(min(index / total_count, 1.0) * 100))
-            else:
-                progress.progress(100)
-
-        status.update(label="Finished processing Magento catalog", state="complete")
-        st.session_state.products = eligible
+        st.session_state.products = items
+        status.update(
+            label=f"Loaded {len(items)} products from Magento",
+            state="complete",
+        )
 
     if st.session_state.products:
-        st.success(f"Loaded {len(st.session_state.products)} eligible products (qty > 1)")
+        st.success(
+            f"Loaded {len(st.session_state.products)} products. "
+            "Filtered by qty>1 and attribute set = Default"
+        )
     else:
-        st.warning("No products found with quantity greater than 1.")
+        st.warning("No products found with qty>1 and attribute set = Default.")
 
 # --- Table + selection ---
 if st.session_state.products:
