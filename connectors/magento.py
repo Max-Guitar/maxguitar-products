@@ -39,5 +39,8 @@ class MagentoClient:
         }
         return self.get("products", params=search)
 
+    def get_stock_item(self, sku):
+        return self.get(f"stockItems/{sku}")
+
 
 client = MagentoClient()
