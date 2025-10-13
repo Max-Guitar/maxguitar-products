@@ -4,7 +4,7 @@ from urllib3.util.retry import Retry
 
 
 DEFAULT_PRODUCT_FIELDS = (
-    "items[sku,name,price,extension_attributes[stock_item[qty,is_in_stock]]],total_count"
+    "items[sku,name,price,attribute_set_id,extension_attributes[stock_item[qty,is_in_stock]]],total_count"
 )
 
 
@@ -14,10 +14,12 @@ class MagentoClient:
     def __init__(self, base_url: str, token: str, timeout=(10, 60)):
         self.base = base_url.rstrip("/")
         self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        })
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+        )
         retry = Retry(
             total=5,
             backoff_factor=0.5,
@@ -28,14 +30,11 @@ class MagentoClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self.timeout = timeout
-        self._last_total_count = None
 
     def get(self, path: str, params=None):
-        response = self.session.get(
-            f"{self.base}{path}", params=params, timeout=self.timeout
-        )
+        response = self.session.get(f"{self.base}{path}", params=params, timeout=self.timeout)
         response.raise_for_status()
-        return response.json()
+        return response.json(), response
 
     @staticmethod
     def _normalize_extension_attributes(product: dict) -> dict:
@@ -58,11 +57,7 @@ class MagentoClient:
     @staticmethod
     def _extract_stock_qty(product: dict) -> float:
         extension_attributes = product.get("extension_attributes") or {}
-        stock_item = (
-            extension_attributes.get("stock_item")
-            if isinstance(extension_attributes, dict)
-            else {}
-        )
+        stock_item = extension_attributes.get("stock_item") if isinstance(extension_attributes, dict) else {}
         if not isinstance(stock_item, dict):
             return 0.0
 
@@ -71,110 +66,36 @@ class MagentoClient:
         except (TypeError, ValueError):
             return 0.0
 
-    def _fetch_product_page(
+    def iter_products_qty_gt(
         self,
-        page: int,
-        page_size: int,
-        fields: str,
-        attribute_set_id: int | None,
-    ):
-        params = {
-            "searchCriteria[currentPage]": page,
-            "searchCriteria[pageSize]": page_size,
-            "fields": fields,
-        }
-        if attribute_set_id is not None:
-            params.update(
-                {
-                    "searchCriteria[filterGroups][0][filters][0][field]": "attribute_set_id",
-                    "searchCriteria[filterGroups][0][filters][0][value]": attribute_set_id,
-                    "searchCriteria[filterGroups][0][filters][0][condition_type]": "eq",
-                }
-            )
-
-        return self.get("/rest/V1/products", params)
-
-    def iter_products(
-        self,
-        qty_min: float | None = 0,
+        qty_min: float = 1,
         page_size: int = 200,
-        max_pages: int = 50,
-        attribute_set_id: int | None = 4,
-        progress_cb=None,
+        max_pages: int = 5,
         fields: str = DEFAULT_PRODUCT_FIELDS,
     ):
-        """Yield products from the paginated Magento API."""
-
-    @staticmethod
-    def _normalize_extension_attributes(product: dict) -> dict:
-        """Ensure extension attributes are exposed as a dictionary."""
-
-        extension_attributes = product.get("extension_attributes") or {}
-        if isinstance(extension_attributes, list):
-            extension_attributes = {
-                entry.get("attribute_code"): entry.get("value")
-                for entry in extension_attributes
-                if isinstance(entry, dict) and "attribute_code" in entry
-            }
-
-        if not isinstance(extension_attributes, dict):
-            extension_attributes = {}
-
-        product["extension_attributes"] = extension_attributes
-        return product
-
-    def _fetch_product_page(self, page: int, page_size: int, fields: str):
-        params = {
-            "searchCriteria[currentPage]": page,
-            "searchCriteria[pageSize]": page_size,
-            "fields": fields,
-        }
-        return self.get("/rest/V1/products", params)
-
-    def get_default_products(self, page_size=200, max_pages=50, fields=DEFAULT_PRODUCT_FIELDS):
-        """Fetch products using the Magento paginated API."""
+        """Yield products whose stock quantity is greater than ``qty_min``."""
 
         page = 1
         fetched = 0
-        items = []
-        total_count = None
 
         while page <= max_pages:
-            data, _ = self._fetch_product_page(page, page_size, fields)
-            total_count = data.get("total_count", total_count)
-            page_items = data.get("items", [])
-            if not page_items:
+            data, _ = self.get(
+                "/rest/V1/products",
+                params={
+                    "searchCriteria[currentPage]": page,
+                    "searchCriteria[pageSize]": page_size,
+                    "fields": fields,
+                },
+            )
+
+            items = data.get("items", [])
+            if not items:
                 break
 
-            for it in items:
-                ext = it.get("extension_attributes") or {}
-                if isinstance(ext, list):
-                    # Some Magento installations serialise extension attributes as
-                    # a list of {"attribute_code": "...", "value": {...}}. Normalize
-                    # this into a dictionary keyed by attribute code so the rest of the
-                    # logic can operate as before.
-                    ext = {
-                        entry.get("attribute_code"): entry.get("value")
-                        for entry in ext
-                        if isinstance(entry, dict) and "attribute_code" in entry
-                    }
-
-                stock_item = {}
-                if isinstance(ext, dict):
-                    stock_item = ext.get("stock_item") or {}
-
-                qty = None
-                if isinstance(stock_item, dict):
-                    qty = stock_item.get("qty")
-                if qty is None:
-                    try:
-                        stock, _ = self.get(f"/rest/V1/stockItems/{it['sku']}")
-                        qty = stock.get("qty")
-                    except Exception:
-                        qty = None
-
-                if qty is not None and float(qty) > float(qty_min):
-                    yield it
+            for product in items:
+                product = self._normalize_extension_attributes(product)
+                if self._extract_stock_qty(product) > qty_min:
+                    yield product
 
             fetched += len(items)
             if fetched >= data.get("total_count", fetched):
@@ -182,21 +103,23 @@ class MagentoClient:
 
             page += 1
 
-    def get_default_products(self, qty_min=1, page_size=200, max_pages=50):
-        """Return a Magento-like payload of products above the quantity threshold."""
+    def get_default_products(self, qty_min: float = 1, page_size: int = 200, max_pages: int = 5):
+        """Return a Magento-style payload of products above the quantity threshold."""
 
-        items = list(
-            self.iter_products_qty_gt(
-                qty_min=qty_min,
-                page_size=page_size,
-                max_pages=max_pages,
+        return {
+            "items": list(
+                self.iter_products_qty_gt(
+                    qty_min=qty_min,
+                    page_size=page_size,
+                    max_pages=max_pages,
+                )
             )
-        )
-        return {"items": items}
+        }
 
     def get_stock_item(self, sku: str):
         data, _ = self.get(f"/rest/V1/stockItems/{sku}")
         return data
+
 
 class StreamlitClient:
     """Lazy wrapper that instantiates :class:`MagentoClient` using Streamlit secrets."""
@@ -217,7 +140,6 @@ class StreamlitClient:
         self._ensure()
         return getattr(self._cli, name)
 
-    # Backwards compatibility for direct method calls
     def get_default_products(self, *args, **kwargs):
         self._ensure()
         return self._cli.get_default_products(*args, **kwargs)
