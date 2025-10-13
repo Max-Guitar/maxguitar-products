@@ -100,16 +100,19 @@ class MagentoClient:
     def get_attribute_set_id(
         self,
         attribute_set_name: str = "Default",
-        fallback: int = 4,
+        fallback: int = 12,
     ) -> int:
         """Return the attribute set ID for the given name, caching lookups."""
         if attribute_set_name in self._attribute_set_ids:
             return self._attribute_set_ids[attribute_set_name]
 
         params = {
-            "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_name",
-            "searchCriteria[filter_groups][0][filters][0][value]": attribute_set_name,
+            "searchCriteria[filter_groups][0][filters][0][field]": "entity_type_id",
+            "searchCriteria[filter_groups][0][filters][0][value]": 4,
             "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+            "searchCriteria[filter_groups][1][filters][0][field]": "attribute_set_name",
+            "searchCriteria[filter_groups][1][filters][0][value]": attribute_set_name,
+            "searchCriteria[filter_groups][1][filters][0][condition_type]": "eq",
         }
 
         attribute_set_id = fallback
@@ -169,7 +172,7 @@ class MagentoClient:
         """
         page = 1
         yielded = 0
-        attrset_id = self.get_attribute_set_id(attribute_set_name)
+        attrset_id = self.get_attribute_set_id(attribute_set_name, fallback=12)
 
         while page <= max_pages and yielded < limit:
             data, _ = self._fetch_products_page(page=page, page_size=page_size, fields=fields, attribute_set_id=attrset_id)
@@ -178,6 +181,12 @@ class MagentoClient:
                 break
 
             for product in items:
+                try:
+                    product_attrset_id = int(product.get("attribute_set_id"))
+                except (TypeError, ValueError):
+                    product_attrset_id = None
+                if product_attrset_id != attrset_id:
+                    continue
                 # Проставим qty (берём из product, а если нет — подтягиваем из stockItems)
                 qty = self._ensure_stock_on_product(product)
                 if qty > qty_min:
