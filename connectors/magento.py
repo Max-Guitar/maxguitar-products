@@ -30,6 +30,7 @@ class MagentoClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self.timeout = timeout
+        self._attribute_set_ids = {}
 
     def get(self, path: str, params=None):
         response = self.session.get(f"{self.base}{path}", params=params, timeout=self.timeout)
@@ -66,26 +67,77 @@ class MagentoClient:
         except (TypeError, ValueError):
             return 0.0
 
+    def get_attribute_set_id(
+        self,
+        attribute_set_name: str = "Default",
+        fallback: int = 4,
+    ) -> int:
+        """Return the attribute set ID for the given name, caching lookups."""
+
+        if attribute_set_name in self._attribute_set_ids:
+            return self._attribute_set_ids[attribute_set_name]
+
+        params = {
+            "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_name",
+            "searchCriteria[filter_groups][0][filters][0][value]": attribute_set_name,
+            "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+        }
+
+        attribute_set_id = fallback
+
+        try:
+            data, _ = self.get("/rest/V1/eav/attribute-sets/list", params=params)
+        except Exception:
+            attribute_set_id = fallback
+        else:
+            items = data.get("items")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("attribute_set_name") == attribute_set_name:
+                        try:
+                            attribute_set_id = int(item.get("attribute_set_id", fallback))
+                        except (TypeError, ValueError):
+                            attribute_set_id = fallback
+                        break
+
+        self._attribute_set_ids[attribute_set_name] = attribute_set_id
+        return attribute_set_id
+
     def iter_products_qty_gt(
         self,
         qty_min: float = 1,
         page_size: int = 200,
         max_pages: int = 5,
         fields: str = DEFAULT_PRODUCT_FIELDS,
+        attribute_set_name: str = "Default",
     ):
         """Yield products whose stock quantity is greater than ``qty_min``."""
 
         page = 1
         fetched = 0
+        attribute_set_id = self.get_attribute_set_id(attribute_set_name=attribute_set_name)
 
         while page <= max_pages:
+            params = {
+                "searchCriteria[currentPage]": page,
+                "searchCriteria[pageSize]": page_size,
+                "fields": fields,
+            }
+
+            if attribute_set_id is not None:
+                params.update(
+                    {
+                        "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
+                        "searchCriteria[filter_groups][0][filters][0][value]": attribute_set_id,
+                        "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+                    }
+                )
+
             data, _ = self.get(
                 "/rest/V1/products",
-                params={
-                    "searchCriteria[currentPage]": page,
-                    "searchCriteria[pageSize]": page_size,
-                    "fields": fields,
-                },
+                params=params,
             )
 
             items = data.get("items", [])
@@ -103,7 +155,13 @@ class MagentoClient:
 
             page += 1
 
-    def get_default_products(self, qty_min: float = 1, page_size: int = 200, max_pages: int = 5):
+    def get_default_products(
+        self,
+        qty_min: float = 1,
+        page_size: int = 200,
+        max_pages: int = 5,
+        attribute_set_name: str = "Default",
+    ):
         """Return a Magento-style payload of products above the quantity threshold."""
 
         return {
@@ -112,6 +170,7 @@ class MagentoClient:
                     qty_min=qty_min,
                     page_size=page_size,
                     max_pages=max_pages,
+                    attribute_set_name=attribute_set_name,
                 )
             )
         }
