@@ -167,10 +167,10 @@ class MagentoClient:
         self,
         qty_min: float = 0,
         page_size: int = 200,
-        max_pages: int = 10,
+        max_pages: int = 3,
         attribute_set_name: str = "Default",
         attribute_set_id: int | None = DEFAULT_ATTRIBUTE_SET_ID,
-        limit: int = 500,
+        limit: int = 200,
         fields: str = DEFAULT_PRODUCT_FIELDS,
     ):
         """
@@ -186,16 +186,29 @@ class MagentoClient:
             else self.get_attribute_set_id(attribute_set_name, fallback=DEFAULT_ATTRIBUTE_SET_ID)
         )
 
+        empty_pages = 0
         while page <= max_pages and yielded < limit:
-            data, _ = self._fetch_products_page(
-                page=page,
-                page_size=page_size,
-                fields=fields,
-                attribute_set_id=attrset_id,
-            )
+            try:
+                data, _ = self._fetch_products_page(
+                    page=page,
+                    page_size=page_size,
+                    fields=fields,
+                    attribute_set_id=attrset_id,
+                )
+            except Exception:
+                # если страница "подвисла" — считаем её пустой и двигаемся дальше
+                empty_pages += 1
+                if empty_pages >= 2:
+                    break
+                page += 1
+                continue
             items = data.get("items") or []
             if not items:
-                break
+                empty_pages += 1
+                if empty_pages >= 2:
+                    break
+                page += 1
+                continue
 
             for product in items:
                 try:
@@ -212,8 +225,8 @@ class MagentoClient:
                     if yielded >= limit:
                         break
 
-            total = data.get("total_count", 0)
-            if page * page_size >= total:
+            total = int(data.get("total_count") or 0)
+            if total and page * page_size >= total:
                 break
             page += 1
 
@@ -227,17 +240,18 @@ class MagentoClient:
         limit: int = 500,
     ):
         """Return a Magento-style payload of products above the quantity threshold and in the Default attribute set."""
-        items = []
-        for product in self.iter_products_qty_gt(
-            qty_min=qty_min,
-            page_size=page_size,
-            max_pages=max_pages,
-            attribute_set_name=attribute_set_name,
-            attribute_set_id=attribute_set_id,
-            limit=limit,
-        ):
+        items = list(
+            self.iter_products_qty_gt(
+                qty_min=qty_min,
+                page_size=page_size,
+                max_pages=max_pages,
+                attribute_set_name=attribute_set_name,
+                attribute_set_id=attribute_set_id,
+                limit=limit,
+            )
+        )
+        for product in items:
             self._ensure_stock_on_product(product)
-            items.append(product)
 
         return {"items": items}
 

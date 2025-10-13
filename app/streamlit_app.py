@@ -84,28 +84,32 @@ def _stock_qty(product: dict) -> float:
         return 0.0
 
 
-# --- Load products (filtered by qty>0 and attribute set id=4) ---
-if st.button("🔄 Load qty>0 & attribute set id=4"):
+# --- Load products (qty>0 & attribute set id=4, capped) ---
+if st.button("🔄 Load Eligible Products (qty>0 & attr set=4, max 200)"):
+    st.session_state.products = []
     with st.status("Loading products from Magento…", expanded=True) as status:
-        status.write(
-            "Requesting product catalog filtered by qty>0 and attribute set id=4…"
+        status.write("Requesting product catalog (page_size=200, max_pages=3, limit=200)…")
+        data = client.get_default_products(
+            qty_min=0,
+            page_size=200,
+            max_pages=3,
+            limit=200,
+            attribute_set_name="Default",
         )
-        data = client.get_default_products()
-        items = data.get("items", [])
-
-        st.session_state.products = items
-        status.update(
-            label=f"Loaded {len(items)} products from Magento",
-            state="complete",
-        )
-
-    if st.session_state.products:
-        st.success(
-            f"Loaded {len(st.session_state.products)} products. "
-            "Filtered by qty>0 and attribute set id = 4"
-        )
-    else:
-        st.warning("No products found with qty>0 and attribute set id = 4.")
+        if not isinstance(data, dict) or "items" not in data:
+            status.update(label="Bad response shape from Magento client", state="error")
+            raise RuntimeError(
+                f"Unexpected response: {type(data)} keys={list(getattr(data,'keys',lambda:[])())}"
+            )
+        items = data.get("items") or []
+        status.write(f"Received {len(items)} products from API.")
+        if not items:
+            status.update(label="No products returned by API", state="error")
+            raise RuntimeError("Empty items from Magento")
+        eligible = [p for p in items if _stock_qty(p) > 0]
+        st.session_state.products = eligible
+        status.update(label="Finished processing Magento catalog", state="complete")
+        st.write(f"Eligible: {len(eligible)} / Total fetched: {len(items)}")
 
 # --- Table + selection ---
 if st.session_state.products:
