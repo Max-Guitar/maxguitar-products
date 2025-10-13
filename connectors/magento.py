@@ -78,19 +78,53 @@ class MagentoClient:
             if not page_items:
                 break
 
-            for product in page_items:
-                items.append(self._normalize_extension_attributes(product))
+            for it in items:
+                ext = it.get("extension_attributes") or {}
+                if isinstance(ext, list):
+                    # Some Magento installations serialise extension attributes as
+                    # a list of {"attribute_code": "...", "value": {...}}. Normalize
+                    # this into a dictionary keyed by attribute code so the rest of the
+                    # logic can operate as before.
+                    ext = {
+                        entry.get("attribute_code"): entry.get("value")
+                        for entry in ext
+                        if isinstance(entry, dict) and "attribute_code" in entry
+                    }
 
-            fetched += len(page_items)
-            if total_count is not None and fetched >= total_count:
+                stock_item = {}
+                if isinstance(ext, dict):
+                    stock_item = ext.get("stock_item") or {}
+
+                qty = None
+                if isinstance(stock_item, dict):
+                    qty = stock_item.get("qty")
+                if qty is None:
+                    try:
+                        stock, _ = self.get(f"/rest/V1/stockItems/{it['sku']}")
+                        qty = stock.get("qty")
+                    except Exception:
+                        qty = None
+
+                if qty is not None and float(qty) > float(qty_min):
+                    yield it
+
+            fetched += len(items)
+            if fetched >= data.get("total_count", fetched):
                 break
 
             page += 1
 
-        if total_count is None:
-            total_count = fetched
+    def get_default_products(self, qty_min=1, page_size=200, max_pages=50):
+        """Return a Magento-like payload of products above the quantity threshold."""
 
-        return {"items": items, "total_count": total_count}
+        items = list(
+            self.iter_products_qty_gt(
+                qty_min=qty_min,
+                page_size=page_size,
+                max_pages=max_pages,
+            )
+        )
+        return {"items": items}
 
     def get_stock_item(self, sku: str):
         data, _ = self.get(f"/rest/V1/stockItems/{sku}")
