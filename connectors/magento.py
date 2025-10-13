@@ -5,6 +5,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 class MagentoClient:
+    """Thin wrapper around the Magento REST API used by the app."""
+
     def __init__(self, base_url: str, token: str, timeout=(10, 60)):
         self.base = base_url.rstrip("/")
         self.session = requests.Session()
@@ -62,27 +64,51 @@ class MagentoClient:
                 break
             page += 1
 
-# ---- Legacy API for streamlit_app.py (no function named `client`) ----
-class Client:
+    def get_default_products(self, qty_min=1, page_size=200, max_pages=50):
+        """Return a Magento-like payload of products above the quantity threshold."""
+
+        items = list(
+            self.iter_products_qty_gt(
+                qty_min=qty_min,
+                page_size=page_size,
+                max_pages=max_pages,
+            )
+        )
+        return {"items": items}
+
+    def get_stock_item(self, sku: str):
+        data, _ = self.get(f"/rest/V1/stockItems/{sku}")
+        return data
+
+class StreamlitClient:
+    """Lazy wrapper that instantiates :class:`MagentoClient` using Streamlit secrets."""
+
     def __init__(self):
         self._cli = None
 
     def _ensure(self):
         if self._cli is None:
             import streamlit as st
+
             self._cli = MagentoClient(
                 st.secrets["MAGENTO_BASE_URL"],
                 st.secrets["MAGENTO_ADMIN_TOKEN"],
             )
 
-    def get_default_products(self, qty_min=1, page_size=200):
+    def __getattr__(self, name):
         self._ensure()
-        items = list(self._cli.iter_products_qty_gt(qty_min=qty_min, page_size=page_size))
-        return {"items": items}
+        return getattr(self._cli, name)
 
-    def get_stock_item(self, sku: str):
+    # Backwards compatibility for direct method calls
+    def get_default_products(self, *args, **kwargs):
         self._ensure()
-        data, _ = self._cli.get(f"/rest/V1/stockItems/{sku}")
-        return data
+        return self._cli.get_default_products(*args, **kwargs)
 
-client = Client()
+    def get_stock_item(self, *args, **kwargs):
+        self._ensure()
+        return self._cli.get_stock_item(*args, **kwargs)
+
+
+# Preserve the historical public API
+Client = StreamlitClient
+client = StreamlitClient()
