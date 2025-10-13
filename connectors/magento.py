@@ -1,46 +1,35 @@
-"""HTTP client helpers for interacting with Magento's REST API."""
+# app/streamlit_app.py (фрагмент загрузки)
+import streamlit as st
+from connectors.magento import MagentoClient
 
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+@st.cache_data(ttl=300, show_spinner=False)
+def load_eligible_products(qty_min: int, page_size: int):
+    cli = MagentoClient(st.secrets["MAGENTO_BASE_URL"], st.secrets["MAGENTO_ADMIN_TOKEN"])
+    rows=[]
+    for i, p in enumerate(cli.iter_products_qty_gt(qty_min=qty_min, page_size=page_size), start=1):
+        rows.append({
+            "sku": p["sku"],
+            "name": p.get("name"),
+            "price": p.get("price"),
+            "qty": p.get("extension_attributes",{}).get("stock_item",{}).get("qty")
+        })
+        if i % 50 == 0:
+            st.session_state["load_progress"]=i
+    return rows
 
-from config import settings
+st.title("Magento Product Enricher")
+qty_min = 1
+page_size = st.sidebar.number_input("Page size", 50, 500, 200, 50)
 
-
-class MagentoClient:
-    """Thin wrapper around Magento REST endpoints used by the Streamlit app."""
-
-    def __init__(self):
-        self.base_url = settings.MAGENTO_BASE_URL.rstrip("/")
-        self.token = settings.MAGENTO_ADMIN_TOKEN
-        self.headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def get(self, endpoint, params=None):
-        """Perform a GET request against a Magento REST endpoint."""
-        url = f"{self.base_url}/rest/V1/{endpoint.lstrip('/')}"
-        r = httpx.get(url, headers=self.headers, params=params, timeout=30)
-        r.raise_for_status()
-        return r.json()
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def patch(self, endpoint, payload):
-        """Perform an update (HTTP PUT) request against a Magento REST endpoint."""
-        url = f"{self.base_url}/rest/V1/{endpoint.lstrip('/')}"
-        r = httpx.put(url, headers=self.headers, json=payload, timeout=30)
-        r.raise_for_status()
-        return r.json()
-
-    def get_default_products(self):
-        """Return products that belong to the default attribute set (id = 4)."""
-        search = {
-            "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
-            "searchCriteria[filter_groups][0][filters][0][value]": "4",  # Default set id
-            "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
-        }
-        return self.get("products", params=search)
-
-    def get_stock_item(self, sku):
-        return self.get(f"stockItems/{sku}")
-
-
-client = MagentoClient()
+if st.button(f"Load Eligible Products (qty > {qty_min})"):
+    try:
+        with st.status("Loading products from Magento…", expanded=True) as s:
+            st.write("Connecting with retries & timeouts…")
+            data = load_eligible_products(qty_min, page_size)
+            if not data:
+                s.update(state="error", label="No products found with qty filter.")
+            else:
+                s.update(state="complete", label=f"Loaded {len(data)} products.")
+                st.dataframe(data, use_container_width=True)
+    except Exception as e:
+        st.error(f"Failed to load: {e}")
