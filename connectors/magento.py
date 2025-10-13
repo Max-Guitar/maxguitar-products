@@ -68,20 +68,27 @@ def client(base_url: str, token: str, timeout=(10, 60)) -> MagentoClient:
     """Factory kept for legacy imports: from connectors.magento import client"""
     return MagentoClient(base_url, token, timeout)
 
-# ---- Legacy wrapper expected by streamlit_app.py ----
-def get_default_products(qty_min=1, page_size=200):
-    import streamlit as st
-    cli = MagentoClient(st.secrets["MAGENTO_BASE_URL"], st.secrets["MAGENTO_ADMIN_TOKEN"])
-    return list(cli.iter_products_qty_gt(qty_min=qty_min, page_size=page_size))
+# ---- Legacy API for streamlit_app.py ----
+class Client:
+    def __init__(self):
+        self._cli = None
 
-class _LegacyClientWrapper:
+    def _ensure(self):
+        if self._cli is None:
+            import streamlit as st
+            self._cli = MagentoClient(
+                st.secrets["MAGENTO_BASE_URL"],
+                st.secrets["MAGENTO_ADMIN_TOKEN"]
+            )
+
     def get_default_products(self, qty_min=1, page_size=200):
-        return get_default_products(qty_min=qty_min, page_size=page_size)
+        self._ensure()
+        items = list(self._cli.iter_products_qty_gt(qty_min=qty_min, page_size=page_size))
+        return {"items": items}  # UI expects dict with "items"
 
-# what streamlit_app imports: from connectors.magento import client
-client = _LegacyClientWrapper()
+    def get_stock_item(self, sku: str):
+        self._ensure()
+        data, _ = self._cli.get(f"/rest/V1/stockItems/{sku}")
+        return data
 
-# optional: factory if you need manual instantiation elsewhere
-def make_client(base_url: str, token: str, timeout=(10,60)) -> MagentoClient:
-    return MagentoClient(base_url, token, timeout)
-
+client = Client()
