@@ -46,9 +46,25 @@ class MagentoClient:
                 break
 
             for it in items:
-                qty = (it.get("extension_attributes", {})
-                         .get("stock_item", {})
-                         .get("qty"))
+                ext = it.get("extension_attributes") or {}
+                if isinstance(ext, list):
+                    # Some Magento installations serialise extension attributes as
+                    # a list of {"attribute_code": "...", "value": {...}}. Normalize
+                    # this into a dictionary keyed by attribute code so the rest of the
+                    # logic can operate as before.
+                    ext = {
+                        entry.get("attribute_code"): entry.get("value")
+                        for entry in ext
+                        if isinstance(entry, dict) and "attribute_code" in entry
+                    }
+
+                stock_item = {}
+                if isinstance(ext, dict):
+                    stock_item = ext.get("stock_item") or {}
+
+                qty = None
+                if isinstance(stock_item, dict):
+                    qty = stock_item.get("qty")
                 if qty is None:
                     try:
                         stock, _ = self.get(f"/rest/V1/stockItems/{it['sku']}")
