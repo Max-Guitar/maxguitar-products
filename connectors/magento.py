@@ -4,6 +4,12 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+
+DEFAULT_PRODUCT_FIELDS = (
+    "items[sku,name,price,extension_attributes[stock_item[qty,is_in_stock]]],total_count"
+)
+
+
 class MagentoClient:
     """Thin wrapper around the Magento REST API used by the app."""
 
@@ -12,7 +18,7 @@ class MagentoClient:
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         })
         retry = Retry(
             total=5,
@@ -31,18 +37,45 @@ class MagentoClient:
         r.raise_for_status()
         return r.json(), time.time() - t0
 
-    def iter_products_qty_gt(self, qty_min=1, page_size=200, max_pages=50):
+    @staticmethod
+    def _normalize_extension_attributes(product: dict) -> dict:
+        """Ensure extension attributes are exposed as a dictionary."""
+
+        extension_attributes = product.get("extension_attributes") or {}
+        if isinstance(extension_attributes, list):
+            extension_attributes = {
+                entry.get("attribute_code"): entry.get("value")
+                for entry in extension_attributes
+                if isinstance(entry, dict) and "attribute_code" in entry
+            }
+
+        if not isinstance(extension_attributes, dict):
+            extension_attributes = {}
+
+        product["extension_attributes"] = extension_attributes
+        return product
+
+    def _fetch_product_page(self, page: int, page_size: int, fields: str):
+        params = {
+            "searchCriteria[currentPage]": page,
+            "searchCriteria[pageSize]": page_size,
+            "fields": fields,
+        }
+        return self.get("/rest/V1/products", params)
+
+    def get_default_products(self, page_size=200, max_pages=50, fields=DEFAULT_PRODUCT_FIELDS):
+        """Fetch products using the Magento paginated API."""
+
         page = 1
         fetched = 0
+        items = []
+        total_count = None
+
         while page <= max_pages:
-            params = {
-                "searchCriteria[currentPage]": page,
-                "searchCriteria[pageSize]": page_size,
-                "fields": "items[sku,name,price,extension_attributes[stock_item[qty,is_in_stock]]],total_count",
-            }
-            data, _ = self.get("/rest/V1/products", params)
-            items = data.get("items", [])
-            if not items:
+            data, _ = self._fetch_product_page(page, page_size, fields)
+            total_count = data.get("total_count", total_count)
+            page_items = data.get("items", [])
+            if not page_items:
                 break
 
             for it in items:
@@ -78,6 +111,7 @@ class MagentoClient:
             fetched += len(items)
             if fetched >= data.get("total_count", fetched):
                 break
+
             page += 1
 
     def get_default_products(self, qty_min=1, page_size=200, max_pages=50):
