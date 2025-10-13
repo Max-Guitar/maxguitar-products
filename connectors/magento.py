@@ -1,12 +1,15 @@
 # connectors/magento.py
+import math
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # Поля для облегчённой выдачи products (qty в products часто отсутствует при MSI)
 DEFAULT_PRODUCT_FIELDS = (
-    "items[sku,name,attribute_set_id,price],total_count"
+    "items[sku,name,attribute_set_id,price,extension_attributes[stock_item[qty,is_in_stock]]],total_count"
 )
 
 
@@ -195,12 +198,14 @@ class MagentoClient:
     def iter_products_qty_gt(
         self,
         qty_min: float = 0,
-        page_size: int = 200,
-        max_pages: int = 10,
+        page_size: int = 500,
+        max_pages: int | None = None,
         attribute_set_name: str = "Default",
         attribute_set_id: int | None = DEFAULT_ATTRIBUTE_SET_ID,
-        limit: int = 600,
+        limit: int = 1000,
         fields: str = DEFAULT_PRODUCT_FIELDS,
+        use_parallel: bool = True,
+        progress_callback=None,
     ):
         """
         Итератор по продуктам с qty>qty_min и attribute_set=attribute_set_name.
@@ -209,14 +214,18 @@ class MagentoClient:
         """
         page = 1
         yielded = 0
+        total = None
+        planned_pages = max_pages if max_pages is not None else None
+        pages_read = 0
         attrset_id = (
             attribute_set_id
             if attribute_set_id is not None
             else self.get_attribute_set_id(attribute_set_name, fallback=DEFAULT_ATTRIBUTE_SET_ID)
         )
 
-        empty_pages = 0
-        while page <= max_pages and yielded < limit:
+        while True:
+            if planned_pages is not None and page > planned_pages:
+                break
             try:
                 data, _ = self._fetch_products_page(
                     page=page,
@@ -224,49 +233,102 @@ class MagentoClient:
                     fields=fields,
                     attribute_set_id=attrset_id,
                 )
+            except requests.HTTPError as exc:
+                status_code = getattr(exc.response, "status_code", None)
+                if status_code in {429, 500, 502, 503, 504}:
+                    time.sleep(0.5)
+                    continue
+                raise
             except Exception:
-                # если страница "подвисла" — считаем её пустой и двигаемся дальше
-                empty_pages += 1
-                if empty_pages >= 2:
-                    break
-                page += 1
-                continue
-            items = data.get("items") or []
-            if not items:
-                empty_pages += 1
-                if empty_pages >= 2:
-                    break
-                page += 1
+                time.sleep(0.1)
                 continue
 
+            pages_read += 1
+            items = data.get("items") or []
+
+            if total is None:
+                total = int(data.get("total_count") or 0)
+                pages = math.ceil(total / page_size) if page_size else 0
+                if pages <= 0:
+                    pages = 1
+                if max_pages is None:
+                    planned_pages = pages
+                else:
+                    planned_pages = min(pages, max_pages or pages)
+                if planned_pages is None or planned_pages <= 0:
+                    planned_pages = 1
+
+            products = []
+            missing_qty_products = []
             for product in items:
+                product = self._normalize_extension_attributes(product)
                 try:
                     product_attrset_id = int(product.get("attribute_set_id"))
                 except (TypeError, ValueError):
                     product_attrset_id = None
                 if product_attrset_id != attrset_id:
                     continue
-                # Проставим qty через MSI salable qty / legacy stock
-                qty = self._get_effective_qty(product, stock_id=1)
+                qty = self._extract_stock_qty_from_product(product)
+                if qty <= 0:
+                    missing_qty_products.append(product)
+                products.append(product)
+
+            if use_parallel and missing_qty_products:
+                with ThreadPoolExecutor(max_workers=16) as executor:
+                    futures = {
+                        executor.submit(self._get_effective_qty, product, 1): product
+                        for product in missing_qty_products
+                    }
+                    for future in as_completed(futures):
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
+
+            for product in products:
+                qty = self._extract_stock_qty_from_product(product)
+                if qty == 0:
+                    qty = self._get_effective_qty(product, stock_id=1)
                 if qty > qty_min:
                     yield product
                     yielded += 1
                     if yielded >= limit:
                         break
 
-            total = int(data.get("total_count") or 0)
-            if total and page * page_size >= total:
+            if progress_callback is not None:
+                try:
+                    progress_callback(
+                        {
+                            "page": page,
+                            "planned_pages": planned_pages or 1,
+                            "pages_read": pages_read,
+                            "items_received": len(items),
+                            "eligible": yielded,
+                            "total_count": total or 0,
+                        }
+                    )
+                except Exception:
+                    pass
+
+            if yielded >= limit:
                 break
+
+            if planned_pages is not None and page >= planned_pages:
+                break
+
             page += 1
+            time.sleep(0.05)
 
     def get_default_products(
         self,
         qty_min: float = 0,
-        page_size: int = 200,
-        max_pages: int = 10,
+        page_size: int = 500,
+        max_pages: int | None = None,
         attribute_set_name: str = "Default",
         attribute_set_id: int | None = DEFAULT_ATTRIBUTE_SET_ID,
-        limit: int = 600,
+        limit: int = 1000,
+        use_parallel: bool = True,
+        progress_callback=None,
     ):
         """Return a Magento-style payload of products above the quantity threshold and in the Default attribute set."""
         items = list(
@@ -277,10 +339,10 @@ class MagentoClient:
                 attribute_set_name=attribute_set_name,
                 attribute_set_id=attribute_set_id,
                 limit=limit,
+                use_parallel=use_parallel,
+                progress_callback=progress_callback,
             )
         )
-        for product in items:
-            self._get_effective_qty(product, stock_id=1)
 
         return {"items": items}
 
