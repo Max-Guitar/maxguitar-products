@@ -1,0 +1,16 @@
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.10.0
+    hooks:
+      - id: black
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: fix-encoding-pragma
+  - repo: local
+    hooks:
+      - id: forbid-tabs
+        name: forbid tabs in python files
+        entry: bash -c "grep -nP '^\t|^\s+\t|\t\s+' **/*.py && exit 1 || true"
+        language: system
+        types: [python]
