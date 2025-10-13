@@ -16,7 +16,7 @@ class MagentoClient:
             total=5,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"]
+            allowed_methods=["GET", "POST"],
         )
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("https://", adapter)
@@ -45,10 +45,9 @@ class MagentoClient:
 
             for it in items:
                 qty = (it.get("extension_attributes", {})
-                        .get("stock_item", {})
-                        .get("qty"))
+                         .get("stock_item", {})
+                         .get("qty"))
                 if qty is None:
-                    # fallback для legacy эндпоинта stockItems/{sku}
                     try:
                         stock, _ = self.get(f"/rest/V1/stockItems/{it['sku']}")
                         qty = stock.get("qty")
@@ -63,12 +62,7 @@ class MagentoClient:
                 break
             page += 1
 
-# ---- Backward compatibility export ----
-def client(base_url: str, token: str, timeout=(10, 60)) -> MagentoClient:
-    """Factory kept for legacy imports: from connectors.magento import client"""
-    return MagentoClient(base_url, token, timeout)
-
-# ---- Legacy API for streamlit_app.py ----
+# ---- Legacy API for streamlit_app.py (no function named `client`) ----
 class Client:
     def __init__(self):
         self._cli = None
@@ -78,13 +72,13 @@ class Client:
             import streamlit as st
             self._cli = MagentoClient(
                 st.secrets["MAGENTO_BASE_URL"],
-                st.secrets["MAGENTO_ADMIN_TOKEN"]
+                st.secrets["MAGENTO_ADMIN_TOKEN"],
             )
 
     def get_default_products(self, qty_min=1, page_size=200):
         self._ensure()
         items = list(self._cli.iter_products_qty_gt(qty_min=qty_min, page_size=page_size))
-        return {"items": items}  # UI expects dict with "items"
+        return {"items": items}
 
     def get_stock_item(self, sku: str):
         self._ensure()
