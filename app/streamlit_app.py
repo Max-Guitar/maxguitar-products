@@ -84,19 +84,39 @@ def _stock_qty(product: dict) -> float:
         return 0.0
 
 
-# --- Load products (qty>0 & attribute set id=4, capped) ---
-if st.button("🔄 Load Eligible Products (qty>0 & attribute set id=4)"):
+# --- Load products (qty>0 & attribute set id=4, fast path) ---
+if st.button("🔄 Load Eligible Products (qty>0 & attribute set id=4 (fast, paginated, parallel))"):
     st.session_state.products = []
     with st.status("Loading products from Magento…", expanded=True) as status:
         status.write(
-            "Requesting product catalog (page_size=200, max_pages=10, limit=600)…"
+            "Requesting product catalog (page_size=500, max_pages=None, limit=1000)…"
         )
+        progress_state = {
+            "items_fetched": 0,
+            "eligible": 0,
+            "total_count": 0,
+            "planned_pages": 0,
+            "pages_read": 0,
+        }
+
+        def _on_progress(info: dict):
+            progress_state["total_count"] = info.get("total_count", 0)
+            progress_state["planned_pages"] = info.get("planned_pages", 0)
+            progress_state["pages_read"] = info.get("pages_read", 0)
+            progress_state["items_fetched"] += info.get("items_received", 0)
+            progress_state["eligible"] = info.get("eligible", 0)
+            status.write(
+                f"page {info.get('page')} / {progress_state['planned_pages']} → received {info.get('items_received')} items, cumulative eligible {progress_state['eligible']}"
+            )
+
         data = client.get_default_products(
             qty_min=0,
-            page_size=200,
-            max_pages=10,
-            limit=600,
+            page_size=500,
+            max_pages=None,
+            limit=1000,
             attribute_set_name="Default",
+            use_parallel=True,
+            progress_callback=_on_progress,
         )
         if not isinstance(data, dict) or "items" not in data:
             status.update(label="Bad response shape from Magento client", state="error")
@@ -110,6 +130,15 @@ if st.button("🔄 Load Eligible Products (qty>0 & attribute set id=4)"):
             raise RuntimeError("Empty items from Magento")
         eligible = [p for p in items if _stock_qty(p) > 0]
         st.session_state.products = eligible
+        status.write(
+            "Summary: total_count={total_count}, pages planned={planned}, pages read={read}, items fetched={fetched}, eligible count={eligible_count}".format(
+                total_count=progress_state.get("total_count", 0),
+                planned=progress_state.get("planned_pages", 0),
+                read=progress_state.get("pages_read", 0),
+                fetched=progress_state.get("items_fetched", 0),
+                eligible_count=len(eligible),
+            )
+        )
         status.update(label="Finished processing Magento catalog", state="complete")
         st.write(f"Eligible: {len(eligible)} / Total fetched: {len(items)}")
 

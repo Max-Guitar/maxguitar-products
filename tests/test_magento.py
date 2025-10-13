@@ -117,6 +117,8 @@ class MagentoClientTestCase(unittest.TestCase):
                     },
                     None,
                 )
+            if path == "/rest/V1/inventory/get-product-salable-quantity/A/1":
+                return (0, None)
             if path == "/rest/V1/stockItems/A":
                 return ({"qty": 2, "is_in_stock": True}, None)
             raise AssertionError(f"Unexpected path: {path}")
@@ -129,22 +131,20 @@ class MagentoClientTestCase(unittest.TestCase):
             products[0]["extension_attributes"]["stock_item"]["qty"], 2
         )
         self.assertIn(("/rest/V1/stockItems/A", None), call_log)
+        self.assertIn(
+            ("/rest/V1/inventory/get-product-salable-quantity/A/1", None), call_log
+        )
 
     def test_get_default_products_returns_items_payload_with_qty(self):
-        sample_product = {"sku": "A", "extension_attributes": {}}
-
-        def ensure(product):
-            product.setdefault("extension_attributes", {}).setdefault("stock_item", {})[
-                "qty"
-            ] = 7
-            return 7
+        sample_product = {
+            "sku": "A",
+            "extension_attributes": {"stock_item": {"qty": 7}},
+        }
 
         with mock.patch.object(
             self.client,
             "iter_products_qty_gt",
             return_value=iter([sample_product]),
-        ), mock.patch.object(
-            self.client, "_ensure_stock_on_product", side_effect=ensure
         ):
             payload = self.client.get_default_products()
 
