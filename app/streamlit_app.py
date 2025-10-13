@@ -31,27 +31,46 @@ st.caption("Streamlit front end for reviewing and enriching Magento catalog data
 
 # --- Load products (eligible: qty > 1) ---
 if st.button("🔄 Load Eligible Products (qty > 1)"):
-    with st.spinner("Loading products from Magento…"):
+    with st.status("Loading products from Magento…", expanded=True) as status:
+        status.write("Requesting product catalog…")
         data = client.get_default_products()
         items = data.get("items", [])
+        total_count = data.get("total_count") or len(items)
+
         eligible = []
-        for product in items:
-            sku = product.get("sku")
-            if not sku:
-                continue
-            try:
-                stock_item = client.get_stock_item(sku)
-            except Exception:
-                continue
-            # qty may be string/None, coerce safely
+        progress = st.progress(0)
+
+        for index, product in enumerate(items, start=1):
+            status.update(
+                label=f"Filtering Magento products ({index}/{total_count or len(items)})",
+                state="running",
+            )
+
+            extension_attributes = product.get("extension_attributes") or {}
+            stock_item = extension_attributes.get("stock_item") if isinstance(extension_attributes, dict) else {}
+            if not isinstance(stock_item, dict):
+                stock_item = {}
+
             try:
                 qty = float(stock_item.get("qty", 0) or 0)
             except (TypeError, ValueError):
                 qty = 0.0
+
             if qty > 1:
                 eligible.append(product)
+
+            if total_count:
+                progress.progress(int(min(index / total_count, 1.0) * 100))
+            else:
+                progress.progress(100)
+
+        status.update(label="Finished processing Magento catalog", state="complete")
         st.session_state.products = eligible
+
+    if st.session_state.products:
         st.success(f"Loaded {len(st.session_state.products)} eligible products (qty > 1)")
+    else:
+        st.warning("No products found with quantity greater than 1.")
 
 # --- Table + selection ---
 if st.session_state.products:
