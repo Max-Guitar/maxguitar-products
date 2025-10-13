@@ -84,11 +84,11 @@ def _stock_qty(product: dict) -> float:
         return 0.0
 
 
-# --- Load products (filtered by qty>1 and attribute set id=12) ---
-if st.button("🔄 Load qty>1 & attribute set id=12"):
+# --- Load products (filtered by qty>0 and attribute set id=4) ---
+if st.button("🔄 Load qty>0 & attribute set id=4"):
     with st.status("Loading products from Magento…", expanded=True) as status:
         status.write(
-            "Requesting product catalog filtered by qty>1 and attribute set id=12…"
+            "Requesting product catalog filtered by qty>0 and attribute set id=4…"
         )
         data = client.get_default_products()
         items = data.get("items", [])
@@ -102,10 +102,10 @@ if st.button("🔄 Load qty>1 & attribute set id=12"):
     if st.session_state.products:
         st.success(
             f"Loaded {len(st.session_state.products)} products. "
-            "Filtered by qty>1 and attribute set id = 12"
+            "Filtered by qty>0 and attribute set id = 4"
         )
     else:
-        st.warning("No products found with qty>1 and attribute set id = 12.")
+        st.warning("No products found with qty>0 and attribute set id = 4.")
 
 # --- Table + selection ---
 if st.session_state.products:
