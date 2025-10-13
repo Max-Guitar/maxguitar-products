@@ -10,6 +10,9 @@ DEFAULT_PRODUCT_FIELDS = (
 )
 
 
+DEFAULT_ATTRIBUTE_SET_ID = 4
+
+
 class MagentoClient:
     """Thin wrapper around the Magento REST API used by the app."""
 
@@ -100,11 +103,15 @@ class MagentoClient:
     def get_attribute_set_id(
         self,
         attribute_set_name: str = "Default",
-        fallback: int = 12,
+        fallback: int = DEFAULT_ATTRIBUTE_SET_ID,
     ) -> int:
         """Return the attribute set ID for the given name, caching lookups."""
         if attribute_set_name in self._attribute_set_ids:
             return self._attribute_set_ids[attribute_set_name]
+
+        if attribute_set_name == "Default":
+            self._attribute_set_ids[attribute_set_name] = DEFAULT_ATTRIBUTE_SET_ID
+            return DEFAULT_ATTRIBUTE_SET_ID
 
         params = {
             "searchCriteria[filter_groups][0][filters][0][field]": "entity_type_id",
@@ -158,10 +165,11 @@ class MagentoClient:
 
     def iter_products_qty_gt(
         self,
-        qty_min: float = 1,
+        qty_min: float = 0,
         page_size: int = 200,
         max_pages: int = 10,
         attribute_set_name: str = "Default",
+        attribute_set_id: int | None = DEFAULT_ATTRIBUTE_SET_ID,
         limit: int = 500,
         fields: str = DEFAULT_PRODUCT_FIELDS,
     ):
@@ -172,10 +180,19 @@ class MagentoClient:
         """
         page = 1
         yielded = 0
-        attrset_id = self.get_attribute_set_id(attribute_set_name, fallback=12)
+        attrset_id = (
+            attribute_set_id
+            if attribute_set_id is not None
+            else self.get_attribute_set_id(attribute_set_name, fallback=DEFAULT_ATTRIBUTE_SET_ID)
+        )
 
         while page <= max_pages and yielded < limit:
-            data, _ = self._fetch_products_page(page=page, page_size=page_size, fields=fields, attribute_set_id=attrset_id)
+            data, _ = self._fetch_products_page(
+                page=page,
+                page_size=page_size,
+                fields=fields,
+                attribute_set_id=attrset_id,
+            )
             items = data.get("items") or []
             if not items:
                 break
@@ -202,24 +219,27 @@ class MagentoClient:
 
     def get_default_products(
         self,
-        qty_min: float = 1,
+        qty_min: float = 0,
         page_size: int = 200,
         max_pages: int = 10,
         attribute_set_name: str = "Default",
+        attribute_set_id: int | None = DEFAULT_ATTRIBUTE_SET_ID,
         limit: int = 500,
     ):
         """Return a Magento-style payload of products above the quantity threshold and in the Default attribute set."""
-        return {
-            "items": list(
-                self.iter_products_qty_gt(
-                    qty_min=qty_min,
-                    page_size=page_size,
-                    max_pages=max_pages,
-                    attribute_set_name=attribute_set_name,
-                    limit=limit,
-                )
-            )
-        }
+        items = []
+        for product in self.iter_products_qty_gt(
+            qty_min=qty_min,
+            page_size=page_size,
+            max_pages=max_pages,
+            attribute_set_name=attribute_set_name,
+            attribute_set_id=attribute_set_id,
+            limit=limit,
+        ):
+            self._ensure_stock_on_product(product)
+            items.append(product)
+
+        return {"items": items}
 
     def get_stock_item(self, sku: str):
         """Legacy method used by old UI paths."""
