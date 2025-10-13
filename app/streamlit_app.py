@@ -85,15 +85,17 @@ def _stock_qty(product: dict) -> float:
 
 
 # --- Load products (qty>0 & attribute set id=4, capped) ---
-if st.button("🔄 Load Eligible Products (qty>0 & attr set=4, max 200)"):
+if st.button("🔄 Load Eligible Products (qty>0 & attribute set id=4)"):
     st.session_state.products = []
     with st.status("Loading products from Magento…", expanded=True) as status:
-        status.write("Requesting product catalog (page_size=200, max_pages=3, limit=200)…")
+        status.write(
+            "Requesting product catalog (page_size=200, max_pages=10, limit=600)…"
+        )
         data = client.get_default_products(
             qty_min=0,
             page_size=200,
-            max_pages=3,
-            limit=200,
+            max_pages=10,
+            limit=600,
             attribute_set_name="Default",
         )
         if not isinstance(data, dict) or "items" not in data:

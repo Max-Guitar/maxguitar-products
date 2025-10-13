@@ -71,6 +71,35 @@ class MagentoClient:
         data, _ = self.get(f"/rest/V1/stockItems/{sku}")
         return data if isinstance(data, dict) else {}
 
+    def _fetch_salable_qty(self, sku: str, stock_id: int = 1) -> float:
+        try:
+            data, _ = self.get(
+                f"/rest/V1/inventory/get-product-salable-quantity/{sku}/{stock_id}"
+            )
+            if isinstance(data, (int, float, str)):
+                return float(data)
+            return float(data or 0)
+        except Exception:
+            return 0.0
+
+    def _get_effective_qty(self, product: dict, stock_id: int = 1) -> float:
+        sku = product.get("sku") or ""
+        if not sku:
+            return 0.0
+        msi_qty = self._fetch_salable_qty(sku, stock_id=stock_id)
+        legacy = self._fetch_stock_for_sku(sku)
+        try:
+            legacy_qty = float(legacy.get("qty") or 0)
+        except Exception:
+            legacy_qty = 0.0
+        qty = max(msi_qty, legacy_qty)
+        ext = product.setdefault("extension_attributes", {})
+        stock_item = ext.setdefault("stock_item", {})
+        if isinstance(stock_item, dict):
+            stock_item["qty"] = qty
+            stock_item["is_in_stock"] = bool(qty and qty > 0)
+        return qty
+
     def _ensure_stock_on_product(self, product: dict) -> float:
         """
         Гарантировать наличие product['extension_attributes']['stock_item']['qty'].
@@ -153,24 +182,24 @@ class MagentoClient:
             "searchCriteria[pageSize]": page_size,
             "fields": fields,
         }
-        if attribute_set_id is not None:
-            params.update(
-                {
-                    "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
-                    "searchCriteria[filter_groups][0][filters][0][value]": attribute_set_id,
-                    "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
-                }
-            )
+        attr_id = DEFAULT_ATTRIBUTE_SET_ID if attribute_set_id is None else attribute_set_id
+        params.update(
+            {
+                "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
+                "searchCriteria[filter_groups][0][filters][0][value]": attr_id,
+                "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+            }
+        )
         return self.get("/rest/V1/products", params=params)
 
     def iter_products_qty_gt(
         self,
         qty_min: float = 0,
         page_size: int = 200,
-        max_pages: int = 3,
+        max_pages: int = 10,
         attribute_set_name: str = "Default",
         attribute_set_id: int | None = DEFAULT_ATTRIBUTE_SET_ID,
-        limit: int = 200,
+        limit: int = 600,
         fields: str = DEFAULT_PRODUCT_FIELDS,
     ):
         """
@@ -217,8 +246,8 @@ class MagentoClient:
                     product_attrset_id = None
                 if product_attrset_id != attrset_id:
                     continue
-                # Проставим qty (берём из product, а если нет — подтягиваем из stockItems)
-                qty = self._ensure_stock_on_product(product)
+                # Проставим qty через MSI salable qty / legacy stock
+                qty = self._get_effective_qty(product, stock_id=1)
                 if qty > qty_min:
                     yield product
                     yielded += 1
@@ -237,7 +266,7 @@ class MagentoClient:
         max_pages: int = 10,
         attribute_set_name: str = "Default",
         attribute_set_id: int | None = DEFAULT_ATTRIBUTE_SET_ID,
-        limit: int = 500,
+        limit: int = 600,
     ):
         """Return a Magento-style payload of products above the quantity threshold and in the Default attribute set."""
         items = list(
@@ -251,7 +280,7 @@ class MagentoClient:
             )
         )
         for product in items:
-            self._ensure_stock_on_product(product)
+            self._get_effective_qty(product, stock_id=1)
 
         return {"items": items}
 
