@@ -29,29 +29,64 @@ if "generated" not in st.session_state:
 
 st.caption("Streamlit front end for reviewing and enriching Magento catalog data.")
 
+def _qty_from_product(product: dict) -> float:
+    """Best-effort stock quantity extraction for Magento products."""
+
+    try:
+        extension_attributes = product.get("extension_attributes") or {}
+        stock_item = (
+            extension_attributes.get("stock_item")
+            if isinstance(extension_attributes, dict)
+            else {}
+        )
+        if not isinstance(stock_item, dict):
+            return 0.0
+
+        return float(stock_item.get("qty", 0) or 0)
+    except Exception:
+        return 0.0
+
+
 # --- Load products (eligible: qty > 1) ---
 if st.button("🔄 Load Eligible Products (qty > 1)"):
-    with st.spinner("Loading products from Magento…"):
+    st.session_state.products = []
+
+    with st.status("Loading products from Magento…", expanded=True) as status:
+        status.write("Requesting product catalog (page_size=200, max_pages=5)…")
+        print("[Streamlit] Loading products (page_size=200, max_pages=5)")
         data = client.get_default_products()
-        items = data.get("items", [])
-        eligible = []
-        for product in items:
-            sku = product.get("sku")
-            if not sku:
-                continue
-            try:
-                stock_item = client.get_stock_item(sku)
-            except Exception:
-                continue
-            # qty may be string/None, coerce safely
-            try:
-                qty = float(stock_item.get("qty", 0) or 0)
-            except (TypeError, ValueError):
-                qty = 0.0
-            if qty > 1:
-                eligible.append(product)
+        print(f"[Streamlit] Raw response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+
+        if not isinstance(data, dict) or "items" not in data:
+            status.update(label="Bad response shape from Magento client", state="error")
+            raise RuntimeError(
+                f"Unexpected response: {type(data)} keys={list(getattr(data, 'keys', lambda: [])())}"
+            )
+
+        items = data.get("items")
+        if not isinstance(items, list):
+            status.update(label="Malformed items payload from Magento", state="error")
+            print(
+                f"[Streamlit] Unexpected items type: {type(items)}"
+            )
+            raise RuntimeError(f"items must be list, received {type(items)}")
+
+        status.write(f"Received {len(items)} products from API.")
+        print(f"[Streamlit] Received {len(items)} products from API")
+
+        if not items:
+            status.update(label="No products returned by API", state="error")
+            raise RuntimeError("Empty items from Magento")
+
+        eligible = [p for p in items if _qty_from_product(p) > 1]
+        print(f"[Streamlit] Eligible products count: {len(eligible)}")
+
         st.session_state.products = eligible
-        st.success(f"Loaded {len(st.session_state.products)} eligible products (qty > 1)")
+        status.update(label="Finished processing Magento catalog", state="complete")
+        status.write(
+            f"Loaded {len(st.session_state.products)} eligible products out of {len(items)} total."
+        )
+        st.write(f"Eligible: {len(eligible)} / Total fetched: {len(items)}")
 
 # --- Table + selection ---
 if st.session_state.products:
