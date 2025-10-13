@@ -29,74 +29,44 @@ if "generated" not in st.session_state:
 
 st.caption("Streamlit front end for reviewing and enriching Magento catalog data.")
 
-# --- Debug: one sample product per attribute_set_id (entity_type_id=4) ---
-with st.expander("🔎 Debug: One product per attribute set", expanded=True):
-    if st.button("List sample products by attribute set"):
-        import requests, pandas as pd
+# --- Debug: check stock for a specific SKU (legacy vs MSI) ---
+with st.expander("🔎 Check stock for SKU (legacy qty vs MSI salable qty)", expanded=True):
+    sku = st.text_input("SKU to check", value="ART-25648")
+    if st.button("Check stock now"):
+        import requests, json
         base = st.secrets["MAGENTO_BASE_URL"].rstrip("/")
         token = st.secrets["MAGENTO_ADMIN_TOKEN"]
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         timeout = (10, 60)
 
-        def _get(path, params=None):
-            r = requests.get(f"{base}{path}", headers=headers, params=params, timeout=timeout)
+        def _get(url):
+            r = requests.get(url, headers=headers, timeout=timeout)
             r.raise_for_status()
             return r.json()
 
-        # 1) Attribute sets for products (entity_type_id=4)
-        aset = _get("/rest/V1/eav/attribute-sets/list", {
-            "searchCriteria[filter_groups][0][filters][0][field]": "entity_type_id",
-            "searchCriteria[filter_groups][0][filters][0][value]": 4,
-            "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
-            "searchCriteria[pageSize]": 100
-        })
-        rows = []
-        for it in aset.get("items", []):
-            aset_id = it.get("attribute_set_id")
-            aset_name = it.get("attribute_set_name")
-            if not aset_id:
-                continue
+        try:
+            legacy = _get(f"{base}/rest/V1/stockItems/{sku}")  # legacy stock_item
+            st.write("Legacy /V1/stockItems response:")
+            st.json(legacy)
 
-            # 2) First product for this attribute set
-            prods = _get("/rest/V1/products", {
-                "searchCriteria[currentPage]": 1,
-                "searchCriteria[pageSize]": 1,
-                "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
-                "searchCriteria[filter_groups][0][filters][0][value]": aset_id,
-                "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
-                "fields": "items[sku,name,attribute_set_id],total_count",
-            })
-            items = prods.get("items") or []
-            if not items:
-                rows.append({
-                    "attribute_set_id": aset_id,
-                    "attribute_set_name": aset_name,
-                    "sku": None, "name": None, "qty": None, "note": "no products"
-                })
-                continue
+            # MSI salable qty (stockId обычно 1; если у тебя другой — поменяй)
+            salable = _get(f"{base}/rest/V1/inventory/get-product-salable-quantity/{sku}/1")
+            st.write("MSI /V1/inventory/get-product-salable-quantity response:")
+            st.json(salable)
 
-            p = items[0]
-            sku = p.get("sku")
-            # 3) Stock for that SKU
-            qty = None
-            if sku:
-                try:
-                    stock = _get(f"/rest/V1/stockItems/{sku}")
-                    qty = float(stock.get("qty") or 0)
-                except Exception:
-                    qty = None
+            try:
+                legacy_qty = float(legacy.get("qty", 0) or 0)
+            except Exception:
+                legacy_qty = 0.0
+            try:
+                msi_salable_qty = float(salable)
+            except Exception:
+                msi_salable_qty = None
 
-            rows.append({
-                "attribute_set_id": p.get("attribute_set_id"),
-                "attribute_set_name": aset_name,
-                "sku": sku,
-                "name": p.get("name"),
-                "qty": qty,
-                "note": ""
-            })
+            st.success(f"SKU={sku} → legacy qty={legacy_qty} ; MSI salable qty={msi_salable_qty}")
+        except Exception as e:
+            st.exception(e)
 
-        df = pd.DataFrame(rows).sort_values(["attribute_set_id"])
-        st.dataframe(df, use_container_width=True)
 
 def _stock_qty(product: dict) -> float:
     extension_attributes = product.get("extension_attributes") or {}
