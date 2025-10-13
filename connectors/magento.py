@@ -67,3 +67,21 @@ class MagentoClient:
 def client(base_url: str, token: str, timeout=(10, 60)) -> MagentoClient:
     """Factory kept for legacy imports: from connectors.magento import client"""
     return MagentoClient(base_url, token, timeout)
+
+# ---- Legacy wrapper expected by streamlit_app.py ----
+def get_default_products(qty_min=1, page_size=200):
+    import streamlit as st
+    cli = MagentoClient(st.secrets["MAGENTO_BASE_URL"], st.secrets["MAGENTO_ADMIN_TOKEN"])
+    return list(cli.iter_products_qty_gt(qty_min=qty_min, page_size=page_size))
+
+class _LegacyClientWrapper:
+    def get_default_products(self, qty_min=1, page_size=200):
+        return get_default_products(qty_min=qty_min, page_size=page_size)
+
+# what streamlit_app imports: from connectors.magento import client
+client = _LegacyClientWrapper()
+
+# optional: factory if you need manual instantiation elsewhere
+def make_client(base_url: str, token: str, timeout=(10,60)) -> MagentoClient:
+    return MagentoClient(base_url, token, timeout)
+
