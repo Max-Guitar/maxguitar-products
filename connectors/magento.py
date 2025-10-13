@@ -1,35 +1,69 @@
-# app/streamlit_app.py (фрагмент загрузки)
-import streamlit as st
-from connectors.magento import MagentoClient
+# connectors/magento.py
+import time
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_eligible_products(qty_min: int, page_size: int):
-    cli = MagentoClient(st.secrets["MAGENTO_BASE_URL"], st.secrets["MAGENTO_ADMIN_TOKEN"])
-    rows=[]
-    for i, p in enumerate(cli.iter_products_qty_gt(qty_min=qty_min, page_size=page_size), start=1):
-        rows.append({
-            "sku": p["sku"],
-            "name": p.get("name"),
-            "price": p.get("price"),
-            "qty": p.get("extension_attributes",{}).get("stock_item",{}).get("qty")
+class MagentoClient:
+    def __init__(self, base_url: str, token: str, timeout=(10, 60)):
+        self.base = base_url.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
         })
-        if i % 50 == 0:
-            st.session_state["load_progress"]=i
-    return rows
+        retry = Retry(
+            total=5,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self.timeout = timeout
 
-st.title("Magento Product Enricher")
-qty_min = 1
-page_size = st.sidebar.number_input("Page size", 50, 500, 200, 50)
+    def get(self, path: str, params=None):
+        t0 = time.time()
+        r = self.session.get(f"{self.base}{path}", params=params, timeout=self.timeout)
+        r.raise_for_status()
+        return r.json(), time.time() - t0
 
-if st.button(f"Load Eligible Products (qty > {qty_min})"):
-    try:
-        with st.status("Loading products from Magento…", expanded=True) as s:
-            st.write("Connecting with retries & timeouts…")
-            data = load_eligible_products(qty_min, page_size)
-            if not data:
-                s.update(state="error", label="No products found with qty filter.")
-            else:
-                s.update(state="complete", label=f"Loaded {len(data)} products.")
-                st.dataframe(data, use_container_width=True)
-    except Exception as e:
-        st.error(f"Failed to load: {e}")
+    def iter_products_qty_gt(self, qty_min=1, page_size=200, max_pages=50):
+        page = 1
+        fetched = 0
+        while page <= max_pages:
+            params = {
+                "searchCriteria[currentPage]": page,
+                "searchCriteria[pageSize]": page_size,
+                "fields": "items[sku,name,price,extension_attributes[stock_item[qty,is_in_stock]]],total_count",
+            }
+            data, _ = self.get("/rest/V1/products", params)
+            items = data.get("items", [])
+            if not items:
+                break
+
+            for it in items:
+                qty = (it.get("extension_attributes", {})
+                        .get("stock_item", {})
+                        .get("qty"))
+                if qty is None:
+                    # fallback для legacy эндпоинта stockItems/{sku}
+                    try:
+                        stock, _ = self.get(f"/rest/V1/stockItems/{it['sku']}")
+                        qty = stock.get("qty")
+                    except Exception:
+                        qty = None
+
+                if qty is not None and float(qty) > float(qty_min):
+                    yield it
+
+            fetched += len(items)
+            if fetched >= data.get("total_count", fetched):
+                break
+            page += 1
+
+# ---- Backward compatibility export ----
+def client(base_url: str, token: str, timeout=(10, 60)) -> MagentoClient:
+    """Factory kept for legacy imports: from connectors.magento import client"""
+    return MagentoClient(base_url, token, timeout)
