@@ -12,17 +12,19 @@ class MagentoClientTestCase(unittest.TestCase):
 
     def test_iter_products_filters_attribute_set(self):
         responses = [
-            ({"items": [{"attribute_set_name": "Default", "attribute_set_id": 42}]}, None),
+            ({"items": [{"attribute_set_name": "Default", "attribute_set_id": 12}]}, None),
             (
                 {
                     "items": [
                         {
                             "sku": "A",
+                            "attribute_set_id": 12,
                             "extension_attributes": {"stock_item": {"qty": 3, "is_in_stock": True}},
                         },
                         {
                             "sku": "B",
-                            "extension_attributes": {"stock_item": {"qty": 0, "is_in_stock": False}},
+                            "attribute_set_id": 99,
+                            "extension_attributes": {"stock_item": {"qty": 3, "is_in_stock": True}},
                         },
                     ],
                     "total_count": 2,
@@ -52,7 +54,7 @@ class MagentoClientTestCase(unittest.TestCase):
         )
         self.assertEqual(
             product_params["searchCriteria[filter_groups][0][filters][0][value]"],
-            42,
+            12,
         )
         self.assertEqual(
             product_params["searchCriteria[filter_groups][0][filters][0][condition_type]"],
@@ -71,6 +73,7 @@ class MagentoClientTestCase(unittest.TestCase):
                     "items": [
                         {
                             "sku": "A",
+                            "attribute_set_id": 12,
                             "extension_attributes": {"stock_item": {"qty": 5, "is_in_stock": True}},
                         }
                     ],
@@ -86,7 +89,7 @@ class MagentoClientTestCase(unittest.TestCase):
         _, product_params = call_log[1]
         self.assertEqual(
             product_params["searchCriteria[filter_groups][0][filters][0][value]"],
-            4,
+            12,
         )
 
     def test_get_default_products_returns_items_payload(self):
