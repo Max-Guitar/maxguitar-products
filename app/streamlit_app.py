@@ -29,6 +29,22 @@ if "generated" not in st.session_state:
 
 st.caption("Streamlit front end for reviewing and enriching Magento catalog data.")
 
+def _stock_qty(product: dict) -> float:
+    extension_attributes = product.get("extension_attributes") or {}
+    stock_item = (
+        extension_attributes.get("stock_item")
+        if isinstance(extension_attributes, dict)
+        else {}
+    )
+    if not isinstance(stock_item, dict):
+        return 0.0
+
+    try:
+        return float(stock_item.get("qty", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 # --- Load products (eligible: qty > 1) ---
 if st.button("🔄 Load Eligible Products (qty > 1)"):
     with st.status("Loading products from Magento…", expanded=True) as status:

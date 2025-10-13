@@ -1,5 +1,3 @@
-# connectors/magento.py
-import time
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -30,12 +28,82 @@ class MagentoClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
         self.timeout = timeout
+        self._last_total_count = None
 
     def get(self, path: str, params=None):
-        t0 = time.time()
-        r = self.session.get(f"{self.base}{path}", params=params, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json(), time.time() - t0
+        response = self.session.get(
+            f"{self.base}{path}", params=params, timeout=self.timeout
+        )
+        response.raise_for_status()
+        return response.json()
+
+    @staticmethod
+    def _normalize_extension_attributes(product: dict) -> dict:
+        """Ensure extension attributes are exposed as a dictionary."""
+
+        extension_attributes = product.get("extension_attributes") or {}
+        if isinstance(extension_attributes, list):
+            extension_attributes = {
+                entry.get("attribute_code"): entry.get("value")
+                for entry in extension_attributes
+                if isinstance(entry, dict) and "attribute_code" in entry
+            }
+
+        if not isinstance(extension_attributes, dict):
+            extension_attributes = {}
+
+        product["extension_attributes"] = extension_attributes
+        return product
+
+    @staticmethod
+    def _extract_stock_qty(product: dict) -> float:
+        extension_attributes = product.get("extension_attributes") or {}
+        stock_item = (
+            extension_attributes.get("stock_item")
+            if isinstance(extension_attributes, dict)
+            else {}
+        )
+        if not isinstance(stock_item, dict):
+            return 0.0
+
+        try:
+            return float(stock_item.get("qty", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _fetch_product_page(
+        self,
+        page: int,
+        page_size: int,
+        fields: str,
+        attribute_set_id: int | None,
+    ):
+        params = {
+            "searchCriteria[currentPage]": page,
+            "searchCriteria[pageSize]": page_size,
+            "fields": fields,
+        }
+        if attribute_set_id is not None:
+            params.update(
+                {
+                    "searchCriteria[filterGroups][0][filters][0][field]": "attribute_set_id",
+                    "searchCriteria[filterGroups][0][filters][0][value]": attribute_set_id,
+                    "searchCriteria[filterGroups][0][filters][0][condition_type]": "eq",
+                }
+            )
+
+        return self.get("/rest/V1/products", params)
+
+    def iter_products(
+        self,
+        qty_min: float | None = 0,
+        page_size: int = 200,
+        max_pages: int = 50,
+        attribute_set_id: int | None = 4,
+        progress_cb=None,
+        fields: str = DEFAULT_PRODUCT_FIELDS,
+    ):
+        """Yield products from the paginated Magento API."""
 
     @staticmethod
     def _normalize_extension_attributes(product: dict) -> dict:
