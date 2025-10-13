@@ -29,61 +29,74 @@ if "generated" not in st.session_state:
 
 st.caption("Streamlit front end for reviewing and enriching Magento catalog data.")
 
-# --- Debug: прямой пинг Magento и 1 товар ---
-with st.expander("🔎 Debug Magento API", expanded=True):
-    if st.button("Ping & Fetch 1 product (raw)"):
-        import requests, time, json
+# --- Debug: one sample product per attribute_set_id (entity_type_id=4) ---
+with st.expander("🔎 Debug: One product per attribute set", expanded=True):
+    if st.button("List sample products by attribute set"):
+        import requests, pandas as pd
         base = st.secrets["MAGENTO_BASE_URL"].rstrip("/")
         token = st.secrets["MAGENTO_ADMIN_TOKEN"]
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         timeout = (10, 60)
 
         def _get(path, params=None):
-            t0=time.time()
             r = requests.get(f"{base}{path}", headers=headers, params=params, timeout=timeout)
-            dt=time.time()-t0
             r.raise_for_status()
-            return r.json(), dt
+            return r.json()
 
-        try:
-            st.write("1) Stores / store views")
-            stores, dt = _get("/rest/V1/store/storeViews")
-            st.write(f"OK in {dt:.2f}s, views: {len(stores)}")
+        # 1) Attribute sets for products (entity_type_id=4)
+        aset = _get("/rest/V1/eav/attribute-sets/list", {
+            "searchCriteria[filter_groups][0][filters][0][field]": "entity_type_id",
+            "searchCriteria[filter_groups][0][filters][0][value]": 4,
+            "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+            "searchCriteria[pageSize]": 100
+        })
+        rows = []
+        for it in aset.get("items", []):
+            aset_id = it.get("attribute_set_id")
+            aset_name = it.get("attribute_set_name")
+            if not aset_id:
+                continue
 
-            st.write("2) Attribute sets (first 5)")
-            aset, dt = _get("/rest/V1/eav/attribute-sets/list", {"searchCriteria[pageSize]": 5})
-            st.write(f"OK in {dt:.2f}s"); st.json(aset)
-
-            st.write("3) Products pageSize=1 (NO fields filter)")
-            data, dt = _get("/rest/V1/products", {
+            # 2) First product for this attribute set
+            prods = _get("/rest/V1/products", {
                 "searchCriteria[currentPage]": 1,
-                "searchCriteria[pageSize]": 1
+                "searchCriteria[pageSize]": 1,
+                "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
+                "searchCriteria[filter_groups][0][filters][0][value]": aset_id,
+                "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+                "fields": "items[sku,name,attribute_set_id],total_count",
             })
-            st.write(f"OK in {dt:.2f}s")
-            items = data.get("items") or []
-            st.write(f"items returned: {len(items)}")
+            items = prods.get("items") or []
             if not items:
-                st.error("Magento вернул 0 товаров — проверь base URL/permissions.")
-            else:
-                p = items[0]
-                st.subheader("First product (raw)")
-                st.json(p)
+                rows.append({
+                    "attribute_set_id": aset_id,
+                    "attribute_set_name": aset_name,
+                    "sku": None, "name": None, "qty": None, "note": "no products"
+                })
+                continue
 
-                sku = p.get("sku")
-                st.write(f"4) Stock for sku={sku}")
-                stock, dt = _get(f"/rest/V1/stockItems/{sku}")
-                st.write(f"OK in {dt:.2f}s"); st.json(stock)
-
-                # удобная сводка:
-                qty = 0.0
+            p = items[0]
+            sku = p.get("sku")
+            # 3) Stock for that SKU
+            qty = None
+            if sku:
                 try:
-                    qty = float(((p.get('extension_attributes') or {}).get('stock_item') or {}).get('qty', 0) or 0)
+                    stock = _get(f"/rest/V1/stockItems/{sku}")
+                    qty = float(stock.get("qty") or 0)
                 except Exception:
-                    pass
-                st.success(f"Summary: sku={sku}, name={p.get('name')}, attribute_set_id={p.get('attribute_set_id')}, qty={qty}")
-        except Exception as e:
-            st.exception(e)
+                    qty = None
 
+            rows.append({
+                "attribute_set_id": p.get("attribute_set_id"),
+                "attribute_set_name": aset_name,
+                "sku": sku,
+                "name": p.get("name"),
+                "qty": qty,
+                "note": ""
+            })
+
+        df = pd.DataFrame(rows).sort_values(["attribute_set_id"])
+        st.dataframe(df, use_container_width=True)
 
 def _stock_qty(product: dict) -> float:
     extension_attributes = product.get("extension_attributes") or {}
