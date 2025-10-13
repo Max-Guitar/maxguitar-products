@@ -1,101 +1,107 @@
-import sys
-from pathlib import Path
-"""Streamlit front end for reviewing and enriching Magento catalog data."""
+# app/streamlit_app.py
 
 import sys
 from pathlib import Path
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
+# make project root importable (for connectors/services)
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import streamlit as st
-import pandas as pd
-
-from connectors.magento import client
-from services.llm_extract import extract_attributes
-from services.normalize import normalize_value
-from services.apply import apply_product_update
-
+# Streamlit config MUST be the first Streamlit command
 st.set_page_config(page_title="Magento Product Enricher", layout="wide")
+
+from connectors.magento import client  # noqa: E402
+from services.llm_extract import extract_attributes  # noqa: E402
+from services.normalize import normalize_value  # noqa: E402
+from services.apply import apply_product_update  # noqa: E402
 
 st.title("🎸 Magento Product Enricher")
 
+# session state
 if "products" not in st.session_state:
     st.session_state.products = []
+if "generated" not in st.session_state:
+    st.session_state.generated = None
 
-if st.button("🔄 Load Eligible Products"):
-    data = client.get_default_products()
-    items = data.get("items", [])
-    eligible = []
-    for product in items:
-        sku = product.get("sku")
-        if not sku:
-            continue
-        try:
-            stock_item = client.get_stock_item(sku)
-        except Exception:
-            continue
-        qty_value = stock_item.get("qty", 0)
-        try:
-            qty = float(qty_value)
-        except (TypeError, ValueError):
-            qty = 0.0
-        if qty > 1:
-            eligible.append(product)
-    st.session_state.products = eligible
-    st.success(f"Loaded {len(st.session_state.products)} eligible products")
+st.caption("Streamlit front end for reviewing and enriching Magento catalog data.")
 
+# --- Load products (eligible: qty > 1) ---
+if st.button("🔄 Load Eligible Products (qty > 1)"):
+    with st.spinner("Loading products from Magento…"):
+        data = client.get_default_products()
+        items = data.get("items", [])
+        eligible = []
+        for product in items:
+            sku = product.get("sku")
+            if not sku:
+                continue
+            try:
+                stock_item = client.get_stock_item(sku)
+            except Exception:
+                continue
+            # qty may be string/None, coerce safely
+            try:
+                qty = float(stock_item.get("qty", 0) or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            if qty > 1:
+                eligible.append(product)
+        st.session_state.products = eligible
+        st.success(f"Loaded {len(st.session_state.products)} eligible products (qty > 1)")
+
+# --- Table + selection ---
 if st.session_state.products:
     df = pd.DataFrame(
         [
             {
-                "sku": p["sku"],
-                "name": p["name"],
-                "attribute_set_id": p["attribute_set_id"],
-                "created_at": p["created_at"],
+                "sku": p.get("sku"),
+                "name": p.get("name"),
+                "attribute_set_id": p.get("attribute_set_id"),
+                "created_at": p.get("created_at"),
             }
             for p in st.session_state.products
         ]
     )
-if st.button("🔄 Load Default Products"):
-    data = client.get_default_products()
-    st.session_state.products = data.get("items", [])
-    st.success(f"Loaded {len(st.session_state.products)} products")
+    st.dataframe(df, use_container_width=True)
 
-if st.session_state.products:
-    df = pd.DataFrame([
-        {"sku": p["sku"], "name": p["name"], "attribute_set_id": p["attribute_set_id"], "created_at": p["created_at"]}
-        for p in st.session_state.products
-    ])
-    st.dataframe(df)
-
-    selected_skus = st.multiselect("Select SKUs to enrich", df["sku"])
+    selected_skus = st.multiselect("Select SKUs to enrich", df["sku"].tolist())
     hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")
 
     if st.button("✨ Generate Specs"):
         results = []
         for sku in selected_skus:
-            product = next(
-                (p for p in st.session_state.products if p["sku"] == sku), None
-            )
-            product = next((p for p in st.session_state.products if p["sku"] == sku), None)
+            product = next((p for p in st.session_state.products if p.get("sku") == sku), None)
             if not product:
                 continue
-            specs = extract_attributes(product["name"], hint)
-            results.append({"sku": sku, **specs})
-        st.session_state.generated = pd.DataFrame(results)
-        st.dataframe(st.session_state.generated)
+            specs = extract_attributes(product.get("name", ""), hint)
 
-    if "generated" in st.session_state:
-        st.subheader("Review & Apply Changes")
-        st.dataframe(st.session_state.generated)
-        if st.button("💾 Write to Magento"):
+            # normalize simple string specs if mapping exists
+            normalized = {}
+            for k, v in (specs or {}).items():
+                if k.startswith("_"):
+                    normalized[k] = v  # pass through error keys
+                else:
+                    normalized[k] = normalize_value(k, v) if isinstance(v, str) else v
+
+            results.append({"sku": sku, **normalized})
+
+        st.session_state.generated = pd.DataFrame(results) if results else None
+        if st.session_state.generated is not None:
+            st.dataframe(st.session_state.generated, use_container_width=True)
+
+# --- Review & apply ---
+if st.session_state.get("generated") is not None and not st.session_state.generated.empty:
+    st.subheader("Review & Apply Changes")
+    st.dataframe(st.session_state.generated, use_container_width=True)
+
+    if st.button("💾 Write to Magento"):
+        with st.spinner("Writing updates to Magento…"):
             for _, row in st.session_state.generated.iterrows():
                 sku = row["sku"]
-                attrs = {k: v for k, v in row.items() if k != "sku"}
+                attrs = {k: row[k] for k in row.index if k != "sku"}
                 apply_product_update(sku, attrs)
-            st.success("All selected products updated!")
+        st.success("All selected products updated!")
