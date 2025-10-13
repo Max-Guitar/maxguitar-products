@@ -29,6 +29,62 @@ if "generated" not in st.session_state:
 
 st.caption("Streamlit front end for reviewing and enriching Magento catalog data.")
 
+# --- Debug: прямой пинг Magento и 1 товар ---
+with st.expander("🔎 Debug Magento API", expanded=True):
+    if st.button("Ping & Fetch 1 product (raw)"):
+        import requests, time, json
+        base = st.secrets["MAGENTO_BASE_URL"].rstrip("/")
+        token = st.secrets["MAGENTO_ADMIN_TOKEN"]
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        timeout = (10, 60)
+
+        def _get(path, params=None):
+            t0=time.time()
+            r = requests.get(f"{base}{path}", headers=headers, params=params, timeout=timeout)
+            dt=time.time()-t0
+            r.raise_for_status()
+            return r.json(), dt
+
+        try:
+            st.write("1) Stores / store views")
+            stores, dt = _get("/rest/V1/store/storeViews")
+            st.write(f"OK in {dt:.2f}s, views: {len(stores)}")
+
+            st.write("2) Attribute sets (first 5)")
+            aset, dt = _get("/rest/V1/eav/attribute-sets/list", {"searchCriteria[pageSize]": 5})
+            st.write(f"OK in {dt:.2f}s"); st.json(aset)
+
+            st.write("3) Products pageSize=1 (NO fields filter)")
+            data, dt = _get("/rest/V1/products", {
+                "searchCriteria[currentPage]": 1,
+                "searchCriteria[pageSize]": 1
+            })
+            st.write(f"OK in {dt:.2f}s")
+            items = data.get("items") or []
+            st.write(f"items returned: {len(items)}")
+            if not items:
+                st.error("Magento вернул 0 товаров — проверь base URL/permissions.")
+            else:
+                p = items[0]
+                st.subheader("First product (raw)")
+                st.json(p)
+
+                sku = p.get("sku")
+                st.write(f"4) Stock for sku={sku}")
+                stock, dt = _get(f"/rest/V1/stockItems/{sku}")
+                st.write(f"OK in {dt:.2f}s"); st.json(stock)
+
+                # удобная сводка:
+                qty = 0.0
+                try:
+                    qty = float(((p.get('extension_attributes') or {}).get('stock_item') or {}).get('qty', 0) or 0)
+                except Exception:
+                    pass
+                st.success(f"Summary: sku={sku}, name={p.get('name')}, attribute_set_id={p.get('attribute_set_id')}, qty={qty}")
+        except Exception as e:
+            st.exception(e)
+
+
 def _stock_qty(product: dict) -> float:
     extension_attributes = product.get("extension_attributes") or {}
     stock_item = (
