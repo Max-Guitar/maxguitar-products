@@ -133,6 +133,14 @@ class MagentoClient:
             items = data or []
         return list(items)
 
+    def get_all_attributes(self) -> List[Dict[str, Any]]:
+        """Return all attribute metadata from the global attributes listing."""
+
+        data = self.get("products/attributes")
+        if isinstance(data, dict):
+            return list(data.get("items", []) or [])
+        return list(data or [])
+
     def get_attributes_for_group(
         self, attribute_set_id: Union[int, str], group_id: Union[int, str]
     ) -> List[Dict[str, Any]]:

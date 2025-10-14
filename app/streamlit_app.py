@@ -108,55 +108,50 @@ if st.session_state.products:
     selected_skus = st.multiselect("Select SKUs", current_df["sku"])
     hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")  # пока не используем
 
-    allowed_codes_cache: Dict[int, Set[str]] = {}
+    all_attr_codes_cache: Set[str] = set()
+    set_allowed_cache: Dict[int, Set[str]] = {}
+    MAX_FIELDS_TO_SHOW = 40
+
+    def fetch_all_attr_codes() -> Set[str]:
+        if all_attr_codes_cache:
+            return all_attr_codes_cache
+        try:
+            data = client.get_all_attributes() or []
+        except Exception as exc:
+            st.warning(f"Failed to load global attributes: {exc}")
+            return set()
+        items = data if isinstance(data, list) else data.get("items", [])
+        for attr in items or []:
+            code = (attr.get("attribute_code") or attr.get("code") or "").strip()
+            if code:
+                all_attr_codes_cache.add(code)
+        return all_attr_codes_cache
 
     def fetch_allowed_codes_for_set(set_id: int | None) -> Set[str]:
-        if set_id is None:
+        if not set_id:
             return set()
-        if set_id in allowed_codes_cache:
-            return allowed_codes_cache[set_id]
-
+        if set_id in set_allowed_cache:
+            return set_allowed_cache[set_id]
         allowed: Set[str] = set()
-
         try:
-            groups = client.get_attribute_groups(set_id) or []
+            attrs = client.get_attributes_for_set(set_id) or []
         except Exception as exc:
-            st.warning(f"Failed to load attribute groups for set {set_id}: {exc}")
-            groups = []
-
-        for group in groups:
-            gid = group.get("attribute_group_id") or group.get("id") or group.get("group_id")
-            if not gid:
-                continue
-            try:
-                attrs = client.get_attributes_for_group(set_id, gid) or []
-            except Exception:
-                continue
-            for attr in attrs:
-                code = (attr.get("attribute_code") or attr.get("code") or "").strip()
-                if code:
-                    allowed.add(code)
-
-        if not allowed:
-            try:
-                attrs = client.get_attributes_for_set(set_id) or []
-            except Exception as exc:
-                st.warning(f"Failed to load attributes for set {set_id}: {exc}")
-                allowed_codes_cache[set_id] = set()
-                return set()
-            for attr in attrs:
-                code = (attr.get("attribute_code") or attr.get("code") or "").strip()
-                if code:
-                    allowed.add(code)
-
-        allowed_codes_cache[set_id] = allowed
+            st.warning(f"Failed to load attributes for set {set_id}: {exc}")
+            set_allowed_cache[set_id] = set()
+            return set()
+        for attr in attrs:
+            code = (attr.get("attribute_code") or attr.get("code") or "").strip()
+            if code:
+                allowed.add(code)
+        set_allowed_cache[set_id] = allowed
         return allowed
 
-    if st.button("✨ Generate Specs"):
+    if st.button("✨ Get Specs"):
         if not selected_skus:
             st.info("Select at least one SKU.")
         else:
             results = []
+            global_codes = fetch_all_attr_codes()
             for sku in selected_skus:
                 product = next(
                     (p for p in st.session_state.products if p.get("sku") == sku),
@@ -180,12 +175,19 @@ if st.session_state.products:
                 except (TypeError, ValueError):
                     set_id = None
                 allowed_codes = fetch_allowed_codes_for_set(set_id)
+                base_filter = allowed_codes if allowed_codes else global_codes
                 filtered = {
                     code: val
                     for code, val in normalized.items()
-                    # если список пуст, оставляем все значения
-                    if not allowed_codes or code in allowed_codes
+                    # если списки пустые, оставляем все значения
+                    if not base_filter or code in base_filter
                 }
+                if len(filtered) > MAX_FIELDS_TO_SHOW:
+                    sorted_items = sorted(filtered.items())
+                    trimmed_items = sorted_items[:MAX_FIELDS_TO_SHOW]
+                    hidden_count = len(filtered) - MAX_FIELDS_TO_SHOW
+                    filtered = dict(trimmed_items)
+                    filtered["_note"] = f"… {hidden_count} more attributes hidden"
                 results.append({"sku": sku, **filtered})
             if results:
                 st.dataframe(pd.DataFrame(results))
