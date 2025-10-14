@@ -506,7 +506,8 @@ if st.session_state.products:
                                         f"Failed to build product payload: {exc}"
                                     )
                                 else:
-                                    st.code(json.dumps(payload["product"], indent=2))
+                                    product_payload = payload.get("product", {})
+                                    st.code(json.dumps(product_payload, indent=2))
 
                                     with st.spinner("Saving attributes to Magento…"):
                                         try:
@@ -517,7 +518,6 @@ if st.session_state.products:
                                                 payload=payload,
                                             )
                                             st.toast("✅ Attributes saved successfully")
-                                            st.json(response)
                                         except httpx.HTTPStatusError as exc:
                                             status_code = getattr(
                                                 exc.response, "status_code", None
@@ -525,38 +525,32 @@ if st.session_state.products:
                                             request_url = getattr(
                                                 exc.request, "url", "Unknown URL"
                                             )
+                                            request_body = getattr(
+                                                exc.request, "content", b""
+                                            )
+                                            if isinstance(request_body, bytes):
+                                                request_body = request_body.decode(
+                                                    "utf-8", errors="replace"
+                                                )
+                                            response_text = getattr(
+                                                exc.response, "text", ""
+                                            )
                                             status_display = status_code or "?"
                                             st.error(
-                                                "❌ Failed to save attributes: "
-                                                f"{status_display} {request_url}"
+                                                "\n".join(
+                                                    [
+                                                        "❌ Failed to save attributes:",
+                                                        f"Status: {status_display}",
+                                                        f"URL: {request_url}",
+                                                        "Request body:",
+                                                        request_body
+                                                        or "<empty request body>",
+                                                        "Response text:",
+                                                        response_text
+                                                        or "<empty response>",
+                                                    ]
+                                                )
                                             )
-
-                                            if (
-                                                isinstance(status_code, int)
-                                                and 400 <= status_code < 500
-                                            ):
-                                                st.write("Status:", status_code)
-                                                st.write("URL:", request_url)
-                                                request_body = getattr(
-                                                    exc.request, "content", b""
-                                                )
-                                                if isinstance(request_body, bytes):
-                                                    request_body = request_body.decode(
-                                                        "utf-8", errors="replace"
-                                                    )
-                                                st.code(
-                                                    request_body
-                                                    or "<empty request body>",
-                                                    language="json",
-                                                )
-                                                response_text = getattr(
-                                                    exc.response, "text", ""
-                                                )
-                                                st.code(
-                                                    response_text
-                                                    or "<empty response>",
-                                                    language="json",
-                                                )
 
                                             st.session_state.last_update = {
                                                 "sku": sku,
@@ -580,7 +574,6 @@ if st.session_state.products:
                                             }
                                             render_update_report()
                                         else:
-                                            st.success("Saved to Magento.")
                                             diff = {
                                                 code: {
                                                     "previous": curr.get(code),
@@ -600,9 +593,18 @@ if st.session_state.products:
                                             custom_attr_updates = {
                                                 code: value
                                                 for code, value in cleaned_values.items()
-                                                if code != "category_ids"
+                                                if code
+                                                not in {
+                                                    "category_ids",
+                                                    "quantity_and_stock_status",
+                                                }
                                             }
                                             curr.update(custom_attr_updates)
+                                            for forbidden in (
+                                                "category_ids",
+                                                "quantity_and_stock_status",
+                                            ):
+                                                curr.pop(forbidden, None)
                                             prod_full["custom_attributes"] = [
                                                 {
                                                     "attribute_code": code,
