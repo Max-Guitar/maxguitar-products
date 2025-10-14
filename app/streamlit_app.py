@@ -180,97 +180,126 @@ if st.session_state.products:
             else:
                 st.info("No specs generated yet. Try adjusting the hint or selection.")
 
-    target_groups = {
-        "General": {"only_codes": {"brand"}},
-        "Filters": {"only_codes": None},
-        "Specifications": {"only_codes": None},
-        "Content": {"only_codes": {"short_description"}},
-    }
-
-    def fetch_target_group_meta_for_set(set_id: int):
-        groups = client.get_attribute_groups(set_id)
-        name_to_id = {g["attribute_group_name"]: g["attribute_group_id"] for g in groups}
-        meta = {}
-        for gname, conf in target_groups.items():
-            gid = name_to_id.get(gname)
-            if not gid:
-                continue
-            attrs = client.get_attributes_for_group(set_id, gid)
-            for attr in attrs:
-                code = attr.get("attribute_code")
-                if not code:
-                    continue
-                if conf["only_codes"] and code not in conf["only_codes"]:
-                    continue
-                meta[code] = {
-                    "group": gname,
-                    "label": attr.get("frontend_label") or code,
-                    "input": attr.get("frontend_input"),
-                    "options": attr.get("options"),
-                }
-        return meta
-
-    attr_meta_cache = {}  # set_id -> meta
-
-    if st.button("🔎 Get Specs"):
+    # --- Unified Attribute Editor ---
+    st.subheader("🛠️ Edit Attributes")
+    if st.button("Open attribute editor for selected"):
         if not selected_skus:
             st.info("Select at least one SKU.")
         else:
             tabs = st.tabs([f"{sku}" for sku in selected_skus])
             for tab, sku in zip(tabs, selected_skus):
                 with tab:
-                    product = next((p for p in st.session_state.products if p["sku"] == sku), None)
+                    product = next((p for p in st.session_state.products if p.get("sku") == sku), None)
                     if not product:
                         st.info("Product not found in session.")
                         continue
-                    prod_full = client.get_product(sku)
+                    try:
+                        prod_full = client.get_product(sku)
+                    except Exception as e:
+                        st.error(f"Failed to load product {sku}: {e}")
+                        continue
                     raw_set_id = prod_full.get("attribute_set_id") or product.get("attribute_set_id")
                     try:
                         set_id = int(raw_set_id)
                     except (TypeError, ValueError):
-                        st.warning("Attribute set is missing for this product; cannot load attributes.")
-                        continue
-                    if set_id not in attr_meta_cache:
-                        attr_meta_cache[set_id] = fetch_target_group_meta_for_set(set_id)
-                    meta = attr_meta_cache[set_id]
+                        set_id = None
+
+                    # Fallback order: attribute-set scoped attrs → global attrs → current custom values
+                    set_attrs = []
+                    try:
+                        if set_id:
+                            set_attrs = client.get_attributes_for_set(set_id) or []
+                    except Exception:
+                        set_attrs = []
+                    if not set_attrs:
+                        all_attrs = []
+                        try:
+                            all_attrs = client.get_all_attributes() or []
+                        except Exception:
+                            pass
+                        set_attrs = all_attrs
+
+                    # Normalize attribute metadata
+                    meta = {}
+                    for a in (set_attrs if isinstance(set_attrs, list) else []):
+                        code = (
+                            a.get("attribute_code")
+                            or a.get("code")
+                            or a.get("attributeCode")
+                            or (a.get("attribute") or {}).get("attribute_code")
+                            or ""
+                        ).strip()
+                        if not code:
+                            continue
+                        meta[code] = {
+                            "label": (a.get("frontend_label") or code),
+                            "input": a.get("frontend_input") or a.get("frontendInput") or "text",
+                            "options": a.get("options") or [],
+                            "group": "",  # group data may be unavailable via API; hide the column
+                        }
+
+                    # Current values on the product
                     curr = {
-                        attr["attribute_code"]: attr.get("value")
-                        for attr in prod_full.get("custom_attributes", [])
+                        attr.get("attribute_code"): attr.get("value")
+                        for attr in (prod_full.get("custom_attributes") or [])
+                        if attr.get("attribute_code")
                     }
 
-                    rows = []
-                    for code, m in meta.items():
-                        rows.append(
+                    if not meta:
+                        st.warning("No attribute metadata available; showing current custom attributes only.")
+                        rows = [
                             {
-                                "attribute_code": code,
-                                "group": m["group"],
-                                "label": m["label"],
-                                "input": m["input"],
-                                "options": ", ".join([opt["label"] for opt in m["options"]]) if m["options"] else "",
-                                "value": curr.get(code, ""),
+                                "attribute_code": k,
+                                "label": k,
+                                "input": "text",
+                                "options": "",
+                                "value": v,
                             }
-                        )
-                    edit_df = pd.DataFrame(rows)
+                            for k, v in curr.items()
+                        ]
+                    else:
+                        # Prepare rows for the editor
+                        rows = []
+                        for code, m in sorted(meta.items()):
+                            opts = m["options"] or []
+                            rows.append(
+                                {
+                                    "attribute_code": code,
+                                    "label": m["label"],
+                                    "input": m["input"],
+                                    "options": ", ".join(
+                                        [str(opt.get("label", "")) for opt in opts if isinstance(opt, dict)]
+                                    ),
+                                    "value": curr.get(code, ""),
+                                }
+                            )
 
+                    edit_df = pd.DataFrame(rows)
                     col_cfg = {
                         "attribute_code": st.column_config.TextColumn(disabled=True),
-                        "group": st.column_config.TextColumn(disabled=True),
                         "label": st.column_config.TextColumn(disabled=True),
                         "input": st.column_config.TextColumn(disabled=True),
                         "options": st.column_config.TextColumn(disabled=True),
                     }
-                    st.caption("Edit values below; select fields expect option *labels* (we'll map to values on save).")
-                    edited = st.data_editor(edit_df, hide_index=True, column_config=col_cfg, key=f"attr_editor_{sku}")
+                    st.caption("Edit values; for selects use option labels — we’ll map to values on save.")
+                    edited = st.data_editor(
+                        edit_df, hide_index=True, column_config=col_cfg, key=f"attr_editor_{sku}"
+                    )
 
                     if st.button(f"💾 Save attributes for {sku}", key=f"write_{sku}"):
                         updates = {}
                         for _, r in edited.iterrows():
                             code = r["attribute_code"]
                             val = r["value"]
-                            m = meta[code]
-                            if m["options"]:
-                                lbl_to_val = {o["label"]: str(o["value"]) for o in m["options"]}
-                                if m["input"] == "multiselect":
+                            m = meta.get(code, {"options": [], "input": "text"})
+                            opts = m["options"] or []
+                            if opts:
+                                lbl_to_val = {
+                                    str(o.get("label")): str(o.get("value"))
+                                    for o in opts
+                                    if isinstance(o, dict)
+                                }
+                                if (m.get("input") or "").lower() == "multiselect":
                                     labels = [x.strip() for x in str(val).split(",") if x.strip()]
                                     mapped = [lbl_to_val.get(x, x) for x in labels]
                                     val = ",".join(mapped)
