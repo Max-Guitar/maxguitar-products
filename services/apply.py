@@ -171,6 +171,23 @@ def normalise_attribute_value(
         if trimmed in {"__no_update__", "no_update"}:
             return None
         return trimmed
+    if code == "quantity_and_stock_status":
+        return None
+    if code == "options_container":
+        if value is None:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if not trimmed:
+                return None
+            if trimmed.lower().startswith("container"):
+                return trimmed
+            if re.fullmatch(r"-?\d+", trimmed):
+                return f"container{int(trimmed)}"
+            return trimmed
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f"container{int(value)}"
+        return str(value)
     if code == "category_ids":
         return _normalise_int_list(value)
     if input_type == "multiselect":
@@ -192,6 +209,7 @@ def build_product_payload(
 
     metadata = metadata or {}
     product: Dict[str, Any] = {"sku": sku}
+    extension_attributes: Dict[str, Any] = {}
     custom_attributes: List[Dict[str, Any]] = []
 
     for code, raw_value in attributes.items():
@@ -200,7 +218,15 @@ def build_product_payload(
         if normalised is None:
             continue
         if code == "category_ids":
-            product["category_ids"] = normalised
+            if not isinstance(normalised, list):
+                raise ValueError("Attribute 'category_ids' must be a list of integers")
+            category_links = [
+                {"category_id": str(category_id)} for category_id in normalised
+            ]
+            if category_links:
+                extension_attributes["category_links"] = category_links
+            continue
+        if code == "quantity_and_stock_status":
             continue
         if attr_meta.get("input", "").lower() == "multiselect":
             if not isinstance(normalised, list) or any(
@@ -218,6 +244,9 @@ def build_product_payload(
                     f"Attribute '{code}' must be normalised to 0 or 1 for boolean fields"
                 )
         custom_attributes.append({"attribute_code": code, "value": normalised})
+
+    if extension_attributes:
+        product["extension_attributes"] = extension_attributes
 
     if custom_attributes:
         product["custom_attributes"] = custom_attributes
