@@ -1,5 +1,6 @@
 """Streamlit front end for reviewing and enriching Magento catalog data."""
 
+import json
 import sys
 from pathlib import Path
 from typing import Dict, Set
@@ -13,7 +14,11 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from connectors.magento import client
-from services.apply import apply_product_update
+from services.apply import (
+    apply_product_update,
+    build_product_payload,
+    normalise_attribute_value,
+)
 from services.llm_extract import extract_attributes
 from services.normalize import normalize_value
 
@@ -382,47 +387,6 @@ if st.session_state.products:
 
                     render_update_report()
 
-                    def _looks_like_float(candidate: str) -> bool:
-                        try:
-                            float(candidate)
-                        except ValueError:
-                            return False
-                        return True
-
-                    def normalise_value(value):
-                        if value is None:
-                            return None
-                        if isinstance(value, str):
-                            trimmed = value.strip()
-                            if not trimmed:
-                                return None
-                            if "," in trimmed:
-                                parts = [p.strip() for p in trimmed.split(",") if p.strip()]
-                                converted_parts = []
-                                for part in parts:
-                                    lowered = part.lower()
-                                    if part.isdigit():
-                                        converted = int(part)
-                                    elif lowered in {"true", "false"}:
-                                        converted = lowered == "true"
-                                    elif _looks_like_float(part):
-                                        converted = float(part)
-                                    else:
-                                        converted = part
-                                    converted_parts.append(converted)
-                                return ",".join(str(p) for p in converted_parts)
-                            if trimmed.isdigit():
-                                return int(trimmed)
-                            lowered = trimmed.lower()
-                            if lowered in {"true", "false"}:
-                                return lowered == "true"
-                            if _looks_like_float(trimmed):
-                                return float(trimmed)
-                            return trimmed
-                        if isinstance(value, (int, float, bool)):
-                            return value
-                        return value
-
                     st.markdown("#### Edit values")
                     with st.form(key=f"attr_form_{sku}", clear_on_submit=False):
                         new_values = {}
@@ -509,119 +473,154 @@ if st.session_state.products:
                             st.session_state["editor_open"] = True
                             st.session_state["selected_product_id"] = to_simple(sku)
 
-                            cleaned_values = {
-                                code: normalise_value(val)
-                                for code, val in new_values.items()
-                            }
-                            cleaned_values = {
-                                k: v
-                                for k, v in cleaned_values.items()
-                                if v is not None and v != ""
-                            }
+                            errors = []
+                            cleaned_values = {}
+                            for code, val in new_values.items():
+                                attr_meta = meta.get(
+                                    code,
+                                    {"label": code, "input": "text", "options": []},
+                                )
+                                try:
+                                    normalised = normalise_attribute_value(
+                                        code, val, attr_meta
+                                    )
+                                except ValueError as exc:
+                                    errors.append(f"{code}: {exc}")
+                                    continue
+                                if normalised is None or normalised == "":
+                                    continue
+                                cleaned_values[code] = normalised
 
-                            if not cleaned_values:
+                            if errors:
+                                for err in errors:
+                                    st.error(f"⚠️ Unable to normalise {err}")
+                            elif not cleaned_values:
                                 st.info("Nothing to update.")
                             else:
-                                payload = {
-                                    "product": {
-                                        "sku": sku,
-                                        "custom_attributes": [
-                                            {
-                                                "attribute_code": k,
-                                                "value": v,
-                                            }
-                                            for k, v in cleaned_values.items()
-                                        ],
-                                    }
-                                }
+                                try:
+                                    payload = build_product_payload(
+                                        sku, cleaned_values, meta
+                                    )
+                                except ValueError as exc:
+                                    st.error(
+                                        f"Failed to build product payload: {exc}"
+                                    )
+                                else:
+                                    st.code(json.dumps(payload["product"], indent=2))
 
-                                with st.spinner("Saving attributes to Magento…"):
-                                    try:
-                                        response = apply_product_update(
-                                            sku, cleaned_values
-                                        )
-                                        st.toast("✅ Attributes saved successfully")
-                                        st.json(response)
-                                    except httpx.HTTPStatusError as exc:
-                                        status_code = getattr(
-                                            exc.response, "status_code", "?"
-                                        )
-                                        request_url = getattr(
-                                            exc.request, "url", "Unknown URL"
-                                        )
-                                        st.error(
-                                            f"❌ Failed to save attributes: {status_code} {request_url}"
-                                        )
-                                        if getattr(exc, "request", None) is not None:
-                                            st.write(
-                                                "Request body:",
-                                                getattr(exc.request, "content", None),
+                                    with st.spinner("Saving attributes to Magento…"):
+                                        try:
+                                            response = apply_product_update(
+                                                sku,
+                                                cleaned_values,
+                                                meta,
+                                                payload=payload,
                                             )
-                                        if getattr(exc, "response", None) is not None:
-                                            st.write(
-                                                "Response text:",
-                                                getattr(exc.response, "text", None),
+                                            st.toast("✅ Attributes saved successfully")
+                                            st.json(response)
+                                        except httpx.HTTPStatusError as exc:
+                                            status_code = getattr(
+                                                exc.response, "status_code", None
                                             )
-                                        st.session_state.last_update = {
-                                            "sku": sku,
-                                            "status": "error",
-                                            "request": payload,
-                                            "response": {
-                                                "status_code": status_code,
-                                                "body": getattr(
-                                                    exc.response, "text", None
-                                                ),
-                                            },
-                                        }
-                                        render_update_report()
-                                    except Exception as exc:
-                                        st.error(f"Unexpected error: {exc}")
-                                        st.session_state.last_update = {
-                                            "sku": sku,
-                                            "status": "error",
-                                            "request": payload,
-                                            "response": {"error": str(exc)},
-                                        }
-                                        render_update_report()
-                                    else:
-                                        st.success("Saved to Magento.")
-                                        diff = {
-                                            code: {
-                                                "previous": curr.get(code),
-                                                "new": value,
-                                            }
-                                            for code, value in cleaned_values.items()
-                                            if curr.get(code) != value
-                                        }
-                                        st.session_state.last_update = {
-                                            "sku": sku,
-                                            "status": "success",
-                                            "request": payload,
-                                            "response": response,
-                                            "diff": diff,
-                                        }
+                                            request_url = getattr(
+                                                exc.request, "url", "Unknown URL"
+                                            )
+                                            status_display = status_code or "?"
+                                            st.error(
+                                                "❌ Failed to save attributes: "
+                                                f"{status_display} {request_url}"
+                                            )
 
-                                        curr.update(cleaned_values)
-                                        prod_full["custom_attributes"] = [
-                                            {
-                                                "attribute_code": code,
-                                                "value": value,
-                                            }
-                                            for code, value in curr.items()
-                                        ]
-                                        st.session_state.product_details[sku] = (
-                                            prod_full
-                                        )
-
-                                        for prod in st.session_state.products:
-                                            if prod.get("sku") == sku:
-                                                prod["custom_attributes"] = prod_full.get(
-                                                    "custom_attributes", []
+                                            if (
+                                                isinstance(status_code, int)
+                                                and 400 <= status_code < 500
+                                            ):
+                                                st.write("Status:", status_code)
+                                                st.write("URL:", request_url)
+                                                request_body = getattr(
+                                                    exc.request, "content", b""
                                                 )
-                                                break
+                                                if isinstance(request_body, bytes):
+                                                    request_body = request_body.decode(
+                                                        "utf-8", errors="replace"
+                                                    )
+                                                st.code(
+                                                    request_body
+                                                    or "<empty request body>",
+                                                    language="json",
+                                                )
+                                                response_text = getattr(
+                                                    exc.response, "text", ""
+                                                )
+                                                st.code(
+                                                    response_text
+                                                    or "<empty response>",
+                                                    language="json",
+                                                )
 
-                                        render_view_table(curr)
-                                        render_update_report()
+                                            st.session_state.last_update = {
+                                                "sku": sku,
+                                                "status": "error",
+                                                "request": payload,
+                                                "response": {
+                                                    "status_code": status_code,
+                                                    "body": getattr(
+                                                        exc.response, "text", None
+                                                    ),
+                                                },
+                                            }
+                                            render_update_report()
+                                        except Exception as exc:
+                                            st.error(f"Unexpected error: {exc}")
+                                            st.session_state.last_update = {
+                                                "sku": sku,
+                                                "status": "error",
+                                                "request": payload,
+                                                "response": {"error": str(exc)},
+                                            }
+                                            render_update_report()
+                                        else:
+                                            st.success("Saved to Magento.")
+                                            diff = {
+                                                code: {
+                                                    "previous": curr.get(code),
+                                                    "new": value,
+                                                }
+                                                for code, value in cleaned_values.items()
+                                                if curr.get(code) != value
+                                            }
+                                            st.session_state.last_update = {
+                                                "sku": sku,
+                                                "status": "success",
+                                                "request": payload,
+                                                "response": response,
+                                                "diff": diff,
+                                            }
+
+                                            custom_attr_updates = {
+                                                code: value
+                                                for code, value in cleaned_values.items()
+                                                if code != "category_ids"
+                                            }
+                                            curr.update(custom_attr_updates)
+                                            prod_full["custom_attributes"] = [
+                                                {
+                                                    "attribute_code": code,
+                                                    "value": value,
+                                                }
+                                                for code, value in curr.items()
+                                            ]
+                                            st.session_state.product_details[sku] = prod_full
+
+                                            for prod in st.session_state.products:
+                                                if prod.get("sku") == sku:
+                                                    prod["custom_attributes"] = prod_full.get(
+                                                        "custom_attributes", []
+                                                    )
+                                                    break
+
+                                            render_view_table(curr)
+                                            render_update_report()
 
         if st.session_state.last_update:
             with st.expander("Last update payload", expanded=False):
