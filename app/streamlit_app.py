@@ -11,8 +11,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from connectors.magento import client
-from services.llm_extract import extract_attributes
-from services.normalize import normalize_value
 from services.apply import apply_product_update
 
 st.set_page_config(page_title="Magento Product Enricher", layout="wide")
@@ -25,8 +23,6 @@ if "products" not in st.session_state:
 if st.button("🔄 Load Default Products"):
     data = client.get_default_products()
     st.session_state.products = data.get("items", [])
-    st.session_state.pop("generated", None)
-    st.session_state.pop("attribute_details", None)
     st.success(f"Loaded {len(st.session_state.products)} products")
 
 if st.session_state.products:
@@ -106,73 +102,108 @@ if st.session_state.products:
             except (TypeError, ValueError):
                 pass
 
-    selected_skus = st.multiselect("Select SKUs to enrich", current_df["sku"])
-    hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")
+    selected_skus = st.multiselect("Select SKUs", current_df["sku"])
+    hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")  # пока не используем
 
-    if st.button("✨ Generate Specs"):
-        results = []
-        attribute_details = {}
-        for sku in selected_skus:
-            product = next((p for p in st.session_state.products if p["sku"] == sku), None)
-            if not product:
+    target_groups = {
+        "General": {"only_codes": {"brand"}},
+        "Filters": {"only_codes": None},
+        "Specifications": {"only_codes": None},
+        "Content": {"only_codes": {"short_description"}},
+    }
+
+    def fetch_attr_meta_for_set(set_id: int):
+        groups = client.get_attribute_groups(set_id)
+        name_to_id = {g["attribute_group_name"]: g["attribute_group_id"] for g in groups}
+        meta = {}
+        for gname, conf in target_groups.items():
+            gid = name_to_id.get(gname)
+            if not gid:
                 continue
-            attr_set_id = product.get("attribute_set_id")
-            attr_set_name = product.get("attribute_set_name")
-            if set_name_by_id and attr_set_name in name_to_id:
-                attr_set_id = name_to_id[attr_set_name]
-            elif attr_set_id is None and attr_set_name:
-                try:
-                    attr_set_id = int(attr_set_name)
-                except (TypeError, ValueError):
-                    attr_set_id = None
-            try:
-                specs = extract_attributes(product["name"], hint)
-                normalized = {k: normalize_value(k, str(v)) for k, v in specs.items()}
-                results.append({"sku": sku, **normalized})
-                if attr_set_id:
-                    attributes = client.get_attributes_for_set(attr_set_id)
-                else:
-                    attributes = []
-                custom_values = {
-                    attr.get("attribute_code"): attr.get("value")
-                    for attr in product.get("custom_attributes", [])
+            attrs = client.get_attributes_for_group(set_id, gid)
+            for attr in attrs:
+                code = attr.get("attribute_code")
+                if not code:
+                    continue
+                if conf["only_codes"] and code not in conf["only_codes"]:
+                    continue
+                meta[code] = {
+                    "group": gname,
+                    "label": attr.get("frontend_label") or code,
+                    "input": attr.get("frontend_input"),
+                    "options": attr.get("options"),
                 }
-                details_rows = [
-                    {
-                        "attribute_code": attr.get("attribute_code"),
-                        "frontend_label": attr.get("frontend_label"),
-                        "current_value": custom_values.get(attr.get("attribute_code"), ""),
-                    }
-                    for attr in attributes
-                ]
-                attribute_details[sku] = pd.DataFrame(
-                    details_rows,
-                    columns=["attribute_code", "frontend_label", "current_value"],
-                )
-            except Exception as e:
-                st.warning(f"Failed to extract for {sku}: {e}")
-        if results:
-            st.session_state.generated = pd.DataFrame(results)
-            st.session_state.attribute_details = attribute_details
-            st.dataframe(st.session_state.generated)
-        else:
-            st.info("No specs generated.")
-            st.session_state.pop("attribute_details", None)
+        return meta
 
-    if "generated" in st.session_state:
-        st.subheader("Review & Apply Changes")
-        st.dataframe(st.session_state.generated)
-        if st.session_state.get("attribute_details"):
-            st.subheader("Attribute Set Details")
-            for sku, details_df in st.session_state.attribute_details.items():
-                st.markdown(f"**{sku}**")
-                if details_df.empty:
-                    st.info("No attributes found for this set.")
-                else:
-                    st.dataframe(details_df[["attribute_code", "frontend_label", "current_value"]])
-        if st.button("💾 Write to Magento"):
-            for _, row in st.session_state.generated.iterrows():
-                sku = row["sku"]
-                attrs = {k: v for k, v in row.items() if k != "sku"}
-                apply_product_update(sku, attrs)
-            st.success("All selected products updated!")
+    attr_cache = {}  # set_id -> meta
+
+    if st.button("🔎 Get Specs"):
+        if not selected_skus:
+            st.info("Select at least one SKU.")
+        else:
+            tabs = st.tabs([f"{sku}" for sku in selected_skus])
+            for tab, sku in zip(tabs, selected_skus):
+                with tab:
+                    product = next((p for p in st.session_state.products if p["sku"] == sku), None)
+                    if not product:
+                        st.info("Product not found in session.")
+                        continue
+                    prod_full = client.get_product(sku)
+                    raw_set_id = prod_full.get("attribute_set_id") or product.get("attribute_set_id")
+                    try:
+                        set_id = int(raw_set_id)
+                    except (TypeError, ValueError):
+                        st.warning("Attribute set is missing for this product; cannot load attributes.")
+                        continue
+                    if set_id not in attr_cache:
+                        attr_cache[set_id] = fetch_attr_meta_for_set(set_id)
+                    meta = attr_cache[set_id]
+                    curr = {
+                        attr["attribute_code"]: attr.get("value")
+                        for attr in prod_full.get("custom_attributes", [])
+                    }
+
+                    rows = []
+                    for code, m in meta.items():
+                        rows.append(
+                            {
+                                "attribute_code": code,
+                                "group": m["group"],
+                                "label": m["label"],
+                                "input": m["input"],
+                                "options": ", ".join([opt["label"] for opt in m["options"]]) if m["options"] else "",
+                                "value": curr.get(code, ""),
+                            }
+                        )
+                    edit_df = pd.DataFrame(rows)
+
+                    col_cfg = {
+                        "attribute_code": st.column_config.TextColumn(disabled=True),
+                        "group": st.column_config.TextColumn(disabled=True),
+                        "label": st.column_config.TextColumn(disabled=True),
+                        "input": st.column_config.TextColumn(disabled=True),
+                        "options": st.column_config.TextColumn(disabled=True),
+                    }
+                    st.caption("Edit values below; select fields expect option *labels* (we'll map to values on save).")
+                    edited = st.data_editor(edit_df, hide_index=True, column_config=col_cfg, key=f"attr_editor_{sku}")
+
+                    if st.button(f"💾 Save attributes for {sku}", key=f"write_{sku}"):
+                        updates = {}
+                        for _, r in edited.iterrows():
+                            code = r["attribute_code"]
+                            val = r["value"]
+                            m = meta[code]
+                            if m["options"]:
+                                lbl_to_val = {o["label"]: str(o["value"]) for o in m["options"]}
+                                if m["input"] == "multiselect":
+                                    labels = [x.strip() for x in str(val).split(",") if x.strip()]
+                                    mapped = [lbl_to_val.get(x, x) for x in labels]
+                                    val = ",".join(mapped)
+                                else:
+                                    val = lbl_to_val.get(str(val), str(val))
+                            updates[code] = val
+                        try:
+                            apply_product_update(sku, updates)
+                            st.success("Saved to Magento.")
+                        except Exception as e:
+                            st.error(f"Failed to save: {e}")
