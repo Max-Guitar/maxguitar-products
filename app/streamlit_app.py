@@ -120,27 +120,43 @@ if st.session_state.products:
         except Exception as exc:
             st.warning(f"Failed to load global attributes: {exc}")
             return set()
-        items = data if isinstance(data, list) else data.get("items", [])
-        for attr in items or []:
-            code = (attr.get("attribute_code") or attr.get("code") or "").strip()
+        if isinstance(data, list):
+            items = data
+        elif isinstance(data, dict):
+            items = data.get("items") or data.get("attributes") or []
+        else:
+            items = []
+        for attr in items:
+            code = (
+                attr.get("attribute_code")
+                or attr.get("code")
+                or attr.get("attributeCode")
+                or ""
+            ).strip()
             if code:
                 all_attr_codes_cache.add(code)
-        return all_attr_codes_cache
+        return set(all_attr_codes_cache)
 
-    def fetch_allowed_codes_for_set(set_id: int | None) -> Set[str]:
+    def fetch_set_allowed_codes(set_id: int | None) -> Set[str]:
         if not set_id:
             return set()
         if set_id in set_allowed_cache:
             return set_allowed_cache[set_id]
         allowed: Set[str] = set()
         try:
-            attrs = client.get_attributes_for_set(set_id) or []
+            raw_attrs = client.get_attributes_for_set(set_id) or []
         except Exception as exc:
             st.warning(f"Failed to load attributes for set {set_id}: {exc}")
             set_allowed_cache[set_id] = set()
             return set()
-        for attr in attrs:
-            code = (attr.get("attribute_code") or attr.get("code") or "").strip()
+        for attr in raw_attrs:
+            code = (
+                attr.get("attribute_code")
+                or attr.get("code")
+                or attr.get("attributeCode")
+                or (attr.get("attribute") or {}).get("attribute_code")
+                or ""
+            ).strip()
             if code:
                 allowed.add(code)
         set_allowed_cache[set_id] = allowed
@@ -174,8 +190,12 @@ if st.session_state.products:
                     set_id = int(raw_set_id)
                 except (TypeError, ValueError):
                     set_id = None
-                allowed_codes = fetch_allowed_codes_for_set(set_id)
-                base_filter = allowed_codes if allowed_codes else global_codes
+                allowed_codes = fetch_set_allowed_codes(set_id)
+                st.info(
+                    f"Set #{set_id}: allowed={len(allowed_codes)}, all={len(global_codes)}",
+                    icon="ℹ️",
+                )
+                base_filter = allowed_codes or global_codes or set()
                 filtered = {
                     code: val
                     for code, val in normalized.items()
