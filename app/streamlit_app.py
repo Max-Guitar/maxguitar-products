@@ -2,7 +2,7 @@
 
 import sys
 from pathlib import Path
-from typing import Dict, Set
+from typing import Set
 
 import pandas as pd
 import streamlit as st
@@ -109,8 +109,7 @@ if st.session_state.products:
     hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")  # пока не используем
 
     all_attr_codes_cache: Set[str] = set()
-    set_allowed_cache: Dict[int, Set[str]] = {}
-    MAX_FIELDS_TO_SHOW = 40
+    MAX_FIELDS_TO_SHOW = 60
 
     def fetch_all_attr_codes() -> Set[str]:
         if all_attr_codes_cache:
@@ -137,37 +136,15 @@ if st.session_state.products:
                 all_attr_codes_cache.add(code)
         return set(all_attr_codes_cache)
 
-    def fetch_set_allowed_codes(set_id: int | None) -> Set[str]:
-        if not set_id:
-            return set()
-        if set_id in set_allowed_cache:
-            return set_allowed_cache[set_id]
-        allowed: Set[str] = set()
-        try:
-            raw_attrs = client.get_attributes_for_set(set_id) or []
-        except Exception as exc:
-            st.warning(f"Failed to load attributes for set {set_id}: {exc}")
-            set_allowed_cache[set_id] = set()
-            return set()
-        for attr in raw_attrs:
-            code = (
-                attr.get("attribute_code")
-                or attr.get("code")
-                or attr.get("attributeCode")
-                or (attr.get("attribute") or {}).get("attribute_code")
-                or ""
-            ).strip()
-            if code:
-                allowed.add(code)
-        set_allowed_cache[set_id] = allowed
-        return allowed
+    def all_attribute_codes() -> Set[str]:
+        return fetch_all_attr_codes()
 
     if st.button("✨ Get Specs"):
         if not selected_skus:
             st.info("Select at least one SKU.")
         else:
             results = []
-            global_codes = fetch_all_attr_codes()
+            global_codes = all_attribute_codes()
             for sku in selected_skus:
                 product = next(
                     (p for p in st.session_state.products if p.get("sku") == sku),
@@ -185,30 +162,19 @@ if st.session_state.products:
                     code: normalize_value(code, str(value))
                     for code, value in (specs or {}).items()
                 }
-                raw_set_id = product.get("attribute_set_id")
-                try:
-                    set_id = int(raw_set_id)
-                except (TypeError, ValueError):
-                    set_id = None
-                allowed_codes = fetch_set_allowed_codes(set_id)
-                st.info(
-                    f"Set #{set_id}: allowed={len(allowed_codes)}, all={len(global_codes)}",
-                    icon="ℹ️",
-                )
-                base_filter = allowed_codes or global_codes or set()
-                filtered = {
+                base_filter = global_codes or set()
+                shown = {
                     code: val
                     for code, val in normalized.items()
-                    # если списки пустые, оставляем все значения
                     if not base_filter or code in base_filter
                 }
-                if len(filtered) > MAX_FIELDS_TO_SHOW:
-                    sorted_items = sorted(filtered.items())
+                if len(shown) > MAX_FIELDS_TO_SHOW:
+                    sorted_items = sorted(shown.items())
                     trimmed_items = sorted_items[:MAX_FIELDS_TO_SHOW]
-                    hidden_count = len(filtered) - MAX_FIELDS_TO_SHOW
-                    filtered = dict(trimmed_items)
-                    filtered["_note"] = f"… {hidden_count} more attributes hidden"
-                results.append({"sku": sku, **filtered})
+                    hidden_count = len(shown) - MAX_FIELDS_TO_SHOW
+                    shown = dict(trimmed_items)
+                    shown["_note"] = f"… {hidden_count} more attributes hidden"
+                results.append({"sku": sku, **shown})
             if results:
                 st.dataframe(pd.DataFrame(results))
             else:
