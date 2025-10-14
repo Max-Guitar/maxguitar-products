@@ -159,6 +159,18 @@ def normalise_attribute_value(
     attr_meta = attr_meta or {}
     input_type = str(attr_meta.get("input") or "").lower()
 
+    if code == "custom_layout_update_file":
+        if value is None:
+            return None
+        if isinstance(value, str):
+            trimmed = value.strip()
+        else:
+            trimmed = str(value).strip()
+        if not trimmed:
+            return None
+        if trimmed in {"__no_update__", "no_update"}:
+            return None
+        return trimmed
     if code == "category_ids":
         return _normalise_int_list(value)
     if input_type == "multiselect":
@@ -221,7 +233,9 @@ def apply_product_update(
 ):
     """Send a Magento product update request for the provided SKU without retries."""
 
-    final_payload = payload or build_product_payload(sku, attributes, metadata)
+    # Always regenerate the payload to ensure fresh normalisation, regardless of
+    # whether a pre-built payload has been supplied.
+    final_payload = build_product_payload(sku, attributes, metadata)
 
     patch_func = getattr(client.patch, "__wrapped__", None)
     if callable(patch_func):
