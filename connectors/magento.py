@@ -5,7 +5,7 @@ from typing import Any, Dict, Iterable, List, Union
 from urllib.parse import quote
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
 
 from config import settings
 
@@ -134,10 +134,21 @@ class MagentoClient:
         future validation.
         """
 
+        endpoint = f"products/attribute-sets/groups/{group_id}/attributes"
         try:
-            data = self.get(f"products/attribute-sets/groups/{group_id}/attributes")
+            data = self.get(endpoint)
+        except RetryError as retry_exc:
+            last_exc_factory = getattr(retry_exc.last_attempt, "exception", None)
+            last_exc = last_exc_factory() if callable(last_exc_factory) else None
+            if (
+                isinstance(last_exc, httpx.HTTPStatusError)
+                and last_exc.response is not None
+                and last_exc.response.status_code in (400, 404)
+            ):
+                return []
+            raise
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in (400, 404):
+            if exc.response is not None and exc.response.status_code in (400, 404):
                 return []
             raise
         items: Iterable[Dict[str, Any]]
