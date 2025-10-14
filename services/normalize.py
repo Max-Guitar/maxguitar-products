@@ -1,27 +1,41 @@
-"""Helpers for mapping fuzzy LLM output to Magento option values."""
-
 from pathlib import Path
-
-import ruamel.yaml as yaml
+from functools import lru_cache
+from typing import Any, Dict, Iterable
+from ruamel.yaml import YAML
 from rapidfuzz import fuzz
 
+yaml = YAML(typ="safe")  # safe loader вместо yaml.safe_load()
 
-def load_map():
-    """Load the attribute normalization map from disk if it exists."""
+@lru_cache(maxsize=1)
+def load_map() -> Dict[str, Any]:
     path = Path("data/attributes_map.yaml")
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        data = yaml.load(f) or {}
+        return data if isinstance(data, dict) else {}
 
+def _iter_variants(x: Any) -> Iterable[str]:
+    if x is None:
+        return []
+    if isinstance(x, (list, tuple, set)):
+        return [str(v) for v in x if v is not None]
+    return [str(x)]
 
-def normalize_value(attr_code, raw_value):
-    """Return the canonical value for a Magento attribute if a close match is found."""
+def normalize_value(attr_code: str, raw_value: Any) -> Any:
+    # если нет карты — вернём исходное
     data = load_map()
     if attr_code not in data:
         return raw_value
-    options = data[attr_code]
+
+    text = "" if raw_value is None else str(raw_value)
+    options = data.get(attr_code) or {}
+
     for canonical, variants in options.items():
-        if any(fuzz.ratio(raw_value.lower(), v.lower()) > 85 for v in variants):
-            return canonical
+        for v in _iter_variants(variants):
+            try:
+                if fuzz.ratio(text.lower(), v.lower()) > 85:
+                    return canonical
+            except Exception:
+                continue
     return raw_value
