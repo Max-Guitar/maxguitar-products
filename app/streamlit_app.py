@@ -245,69 +245,108 @@ if st.session_state.products:
                         if attr.get("attribute_code")
                     }
 
-                    if not meta:
+                    # --- Просмотр (таблица) только с текущими значениями ---
+                    view_rows = []
+                    for code, m in sorted(meta.items()):
+                        opts = [o for o in (m["options"] or []) if isinstance(o, dict)]
+                        val_raw = curr.get(code, "")
+                        # Преобразуем raw value -> label для отображения
+                        if opts:
+                            val_map = {str(o.get("value")): str(o.get("label")) for o in opts}
+                            if (
+                                isinstance(val_raw, str)
+                                and "," in val_raw
+                                and (m["input"] or "").lower() == "multiselect"
+                            ):
+                                labels = [val_map.get(x.strip(), x.strip()) for x in val_raw.split(",")]
+                                val_disp = ", ".join([x for x in labels if x])
+                            else:
+                                val_disp = val_map.get(str(val_raw), str(val_raw))
+                        else:
+                            val_disp = str(val_raw)
+                        view_rows.append({"attribute_code": code, "label": m["label"], "value": val_disp})
+
+                    if view_rows:
+                        st.dataframe(pd.DataFrame(view_rows), hide_index=True, use_container_width=True)
+                    elif curr:
                         st.warning("No attribute metadata available; showing current custom attributes only.")
-                        rows = [
-                            {
-                                "attribute_code": k,
-                                "label": k,
-                                "input": "text",
-                                "options": "",
-                                "value": v,
-                            }
-                            for k, v in curr.items()
+                        fallback_rows = [
+                            {"attribute_code": k, "label": k, "value": str(v)}
+                            for k, v in sorted(curr.items())
                         ]
-                    else:
-                        # Prepare rows for the editor
-                        rows = []
-                        for code, m in sorted(meta.items()):
-                            opts = m["options"] or []
-                            rows.append(
-                                {
-                                    "attribute_code": code,
-                                    "label": m["label"],
-                                    "input": m["input"],
-                                    "options": ", ".join(
-                                        [str(opt.get("label", "")) for opt in opts if isinstance(opt, dict)]
-                                    ),
-                                    "value": curr.get(code, ""),
-                                }
-                            )
+                        st.dataframe(pd.DataFrame(fallback_rows), hide_index=True, use_container_width=True)
 
-                    edit_df = pd.DataFrame(rows)
-                    col_cfg = {
-                        "attribute_code": st.column_config.TextColumn(disabled=True),
-                        "label": st.column_config.TextColumn(disabled=True),
-                        "input": st.column_config.TextColumn(disabled=True),
-                        "options": st.column_config.TextColumn(disabled=True),
-                    }
-                    st.caption("Edit values; for selects use option labels — we’ll map to values on save.")
-                    edited = st.data_editor(
-                        edit_df, hide_index=True, column_config=col_cfg, key=f"attr_editor_{sku}"
-                    )
+                    # --- Редактирование (виджеты: selectbox/multiselect/text) ---
+                    st.markdown("#### Edit values")
+                    with st.form(key=f"attr_form_{sku}", clear_on_submit=False):
+                        new_values = {}
+                        edit_targets = (
+                            sorted(meta.keys()) if meta else sorted(curr.keys())
+                        )
+                        for code in edit_targets:
+                            m = meta.get(code, {"label": code, "input": "text", "options": []})
+                            label = m["label"]
+                            input_type = (m.get("input") or "").lower()
+                            opts = [o for o in (m.get("options") or []) if isinstance(o, dict)]
+                            current_raw = curr.get(code, "")
 
-                    if st.button(f"💾 Save attributes for {sku}", key=f"write_{sku}"):
-                        updates = {}
-                        for _, r in edited.iterrows():
-                            code = r["attribute_code"]
-                            val = r["value"]
-                            m = meta.get(code, {"options": [], "input": "text"})
-                            opts = m["options"] or []
                             if opts:
-                                lbl_to_val = {
-                                    str(o.get("label")): str(o.get("value"))
-                                    for o in opts
-                                    if isinstance(o, dict)
-                                }
-                                if (m.get("input") or "").lower() == "multiselect":
-                                    labels = [x.strip() for x in str(val).split(",") if x.strip()]
-                                    mapped = [lbl_to_val.get(x, x) for x in labels]
-                                    val = ",".join(mapped)
+                                labels = [str(o.get("label")) for o in opts]
+                                lbl_to_val = {str(o.get("label")): str(o.get("value")) for o in opts}
+                                # Текущее значение -> label
+                                if input_type == "multiselect":
+                                    cur_labels = []
+                                    if isinstance(current_raw, str) and current_raw:
+                                        for v in [x.strip() for x in current_raw.split(",") if x.strip()]:
+                                            found = next(
+                                                (
+                                                    str(o.get("label"))
+                                                    for o in opts
+                                                    if str(o.get("value")) == v
+                                                ),
+                                                v,
+                                            )
+                                            cur_labels.append(found)
+                                    sel = st.multiselect(
+                                        label,
+                                        labels,
+                                        default=cur_labels,
+                                        key=f"{sku}_{code}",
+                                    )
+                                    mapped = [lbl_to_val.get(s, s) for s in sel]
+                                    new_values[code] = ",".join(mapped)
                                 else:
-                                    val = lbl_to_val.get(str(val), str(val))
-                            updates[code] = val
-                        try:
-                            apply_product_update(sku, updates)
-                            st.success("Saved to Magento.")
-                        except Exception as e:
-                            st.error(f"Failed to save: {e}")
+                                    cur_label = next(
+                                        (
+                                            str(o.get("label"))
+                                            for o in opts
+                                            if str(o.get("value")) == str(current_raw)
+                                        ),
+                                        str(current_raw),
+                                    )
+                                    sel = st.selectbox(
+                                        label,
+                                        labels,
+                                        index=(labels.index(cur_label) if cur_label in labels else 0)
+                                        if labels
+                                        else None,
+                                        key=f"{sku}_{code}",
+                                    )
+                                    new_values[code] = lbl_to_val.get(sel, sel)
+                            else:
+                                new_values[code] = st.text_input(
+                                    label,
+                                    value=str(current_raw or ""),
+                                    key=f"{sku}_{code}",
+                                )
+
+                        submitted = st.form_submit_button(f"💾 Save attributes for {sku}")
+                        if submitted:
+                            if not new_values:
+                                st.info("Nothing to update.")
+                            else:
+                                try:
+                                    apply_product_update(sku, new_values)
+                                    st.success("Saved to Magento.")
+                                except Exception as e:
+                                    st.error(f"Failed to save: {e}")
