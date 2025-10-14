@@ -1,5 +1,6 @@
 streamlit>=1.36
 pandas>=2.2
+streamlit-aggrid>=0.3.4.post3
 httpx>=0.27
 tenacity>=8.2
 pydantic-settings>=2.3

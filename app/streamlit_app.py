@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 
 from connectors.magento import client
 from services.apply import apply_product_update
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 from services.llm_extract import extract_attributes
 from services.normalize import normalize_value
 
@@ -245,108 +246,110 @@ if st.session_state.products:
                         if attr.get("attribute_code")
                     }
 
-                    # --- Просмотр (таблица) только с текущими значениями ---
-                    view_rows = []
+                    # --- ЕДИНАЯ ТАБЛИЦА-РЕДАКТОР С ПОДДЕРЖКОЙ ВЫПАДАЮЩИХ СПИСКОВ ---
+                    rows = []
                     for code, m in sorted(meta.items()):
-                        opts = [o for o in (m["options"] or []) if isinstance(o, dict)]
-                        val_raw = curr.get(code, "")
-                        # Преобразуем raw value -> label для отображения
-                        if opts:
-                            val_map = {str(o.get("value")): str(o.get("label")) for o in opts}
-                            if (
-                                isinstance(val_raw, str)
-                                and "," in val_raw
-                                and (m["input"] or "").lower() == "multiselect"
-                            ):
-                                labels = [val_map.get(x.strip(), x.strip()) for x in val_raw.split(",")]
-                                val_disp = ", ".join([x for x in labels if x])
-                            else:
-                                val_disp = val_map.get(str(val_raw), str(val_raw))
-                        else:
-                            val_disp = str(val_raw)
-                        view_rows.append({"attribute_code": code, "label": m["label"], "value": val_disp})
+                        opts = [o for o in (m.get("options") or []) if isinstance(o, dict)]
+                        current_raw = curr.get(code, "")
+                        input_type = (m.get("input") or "").lower()
 
-                    if view_rows:
-                        st.dataframe(pd.DataFrame(view_rows), hide_index=True, use_container_width=True)
-                    elif curr:
-                        st.warning("No attribute metadata available; showing current custom attributes only.")
-                        fallback_rows = [
-                            {"attribute_code": k, "label": k, "value": str(v)}
+                        if opts and input_type != "multiselect":
+                            val_map = {str(o.get("value")): str(o.get("label")) for o in opts}
+                            display_value = val_map.get(str(current_raw), str(current_raw))
+                        else:
+                            display_value = str(current_raw or "")
+
+                        rows.append(
+                            {
+                                "attribute_code": code,
+                                "label": m.get("label", code),
+                                "input": input_type,
+                                "options": [str(o.get("label")) for o in opts],
+                                "opt_map_json": {str(o.get("label")): str(o.get("value")) for o in opts},
+                                "value_display": display_value,
+                            }
+                        )
+
+                    if not rows and curr:
+                        # Фолбэк, если нет метаданных
+                        rows = [
+                            {
+                                "attribute_code": k,
+                                "label": k,
+                                "input": "text",
+                                "options": [],
+                                "opt_map_json": {},
+                                "value_display": str(v),
+                            }
                             for k, v in sorted(curr.items())
                         ]
-                        st.dataframe(pd.DataFrame(fallback_rows), hide_index=True, use_container_width=True)
 
-                    # --- Редактирование (виджеты: selectbox/multiselect/text) ---
-                    st.markdown("#### Edit values")
-                    with st.form(key=f"attr_form_{sku}", clear_on_submit=False):
-                        new_values = {}
-                        edit_targets = (
-                            sorted(meta.keys()) if meta else sorted(curr.keys())
-                        )
-                        for code in edit_targets:
-                            m = meta.get(code, {"label": code, "input": "text", "options": []})
-                            label = m["label"]
-                            input_type = (m.get("input") or "").lower()
-                            opts = [o for o in (m.get("options") or []) if isinstance(o, dict)]
-                            current_raw = curr.get(code, "")
+                    df = pd.DataFrame(rows)
 
-                            if opts:
-                                labels = [str(o.get("label")) for o in opts]
-                                lbl_to_val = {str(o.get("label")): str(o.get("value")) for o in opts}
-                                # Текущее значение -> label
-                                if input_type == "multiselect":
-                                    cur_labels = []
-                                    if isinstance(current_raw, str) and current_raw:
-                                        for v in [x.strip() for x in current_raw.split(",") if x.strip()]:
-                                            found = next(
-                                                (
-                                                    str(o.get("label"))
-                                                    for o in opts
-                                                    if str(o.get("value")) == v
-                                                ),
-                                                v,
-                                            )
-                                            cur_labels.append(found)
-                                    sel = st.multiselect(
-                                        label,
-                                        labels,
-                                        default=cur_labels,
-                                        key=f"{sku}_{code}",
-                                    )
-                                    mapped = [lbl_to_val.get(s, s) for s in sel]
-                                    new_values[code] = ",".join(mapped)
-                                else:
-                                    cur_label = next(
-                                        (
-                                            str(o.get("label"))
-                                            for o in opts
-                                            if str(o.get("value")) == str(current_raw)
-                                        ),
-                                        str(current_raw),
-                                    )
-                                    sel = st.selectbox(
-                                        label,
-                                        labels,
-                                        index=(labels.index(cur_label) if cur_label in labels else 0)
-                                        if labels
-                                        else None,
-                                        key=f"{sku}_{code}",
-                                    )
-                                    new_values[code] = lbl_to_val.get(sel, sel)
-                            else:
-                                new_values[code] = st.text_input(
-                                    label,
-                                    value=str(current_raw or ""),
-                                    key=f"{sku}_{code}",
-                                )
+                    gob = GridOptionsBuilder.from_dataframe(df, editable=True)
+                    gob.configure_column("attribute_code", header_name="Code", editable=False)
+                    gob.configure_column("label", header_name="Attribute", editable=False)
+                    gob.configure_column("input", hide=True)
+                    gob.configure_column("options", hide=True)
+                    gob.configure_column("opt_map_json", hide=True)
 
-                        submitted = st.form_submit_button(f"💾 Save attributes for {sku}")
-                        if submitted:
-                            if not new_values:
-                                st.info("Nothing to update.")
-                            else:
-                                try:
-                                    apply_product_update(sku, new_values)
-                                    st.success("Saved to Magento.")
-                                except Exception as e:
-                                    st.error(f"Failed to save: {e}")
+                    cell_editor_selector = JsCode(
+                        """
+                        function(params) {
+                          if (params.data && params.data.options && params.data.options.length > 0 && params.data.input !== 'multiselect') {
+                            return { component: 'agSelectCellEditor', params: { values: params.data.options } };
+                          }
+                          return null;
+                        }
+                        """
+                    )
+
+                    gob.configure_column(
+                        "value_display",
+                        header_name="Value",
+                        editable=True,
+                        cellEditorSelector=cell_editor_selector,
+                    )
+                    gob.configure_grid_options(suppressRowClickSelection=True)
+
+                    grid_response = AgGrid(
+                        df,
+                        gridOptions=gob.build(),
+                        update_mode=GridUpdateMode.VALUE_CHANGED,
+                        allow_unsafe_jscode=True,
+                        fit_columns_on_grid_load=True,
+                        height=520,
+                    )
+
+                    updated_df = pd.DataFrame(grid_response.get("data", []))
+                    updates = {}
+
+                    for _, row in updated_df.iterrows():
+                        code = row.get("attribute_code")
+                        if not code:
+                            continue
+                        display_value = str(row.get("value_display") or "")
+                        input_type = str(row.get("input") or "")
+                        opt_map = row.get("opt_map_json") or {}
+
+                        if isinstance(opt_map, str):
+                            try:
+                                import json as _json
+
+                                opt_map = _json.loads(opt_map)
+                            except Exception:
+                                opt_map = {}
+
+                        if input_type == "multiselect":
+                            labels = [x.strip() for x in display_value.split(",") if x.strip()]
+                            mapped = [opt_map.get(lbl, lbl) for lbl in labels]
+                            updates[code] = ",".join(mapped)
+                        else:
+                            updates[code] = opt_map.get(display_value, display_value)
+
+                    if st.button(f"💾 Save attributes for {sku}", key=f"save_{sku}"):
+                        try:
+                            apply_product_update(sku, updates)
+                            st.success("Saved to Magento.")
+                        except Exception as e:
+                            st.error(f"Failed to save: {e}")
