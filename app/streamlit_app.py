@@ -21,16 +21,19 @@ st.set_page_config(page_title="Magento Product Enricher", layout="wide")
 
 st.title("🎸 Magento Product Enricher")
 
-if "products" not in st.session_state:
-    st.session_state.products = []
-if "product_details" not in st.session_state:
-    st.session_state.product_details = {}
-if "selected_product_id" not in st.session_state:
-    st.session_state.selected_product_id = None
-if "editor_open" not in st.session_state:
-    st.session_state.editor_open = False
-if "last_update" not in st.session_state:
-    st.session_state.last_update = None
+st.session_state.setdefault("products", [])
+st.session_state.setdefault("product_details", {})
+st.session_state.setdefault("selected_product_id", None)
+st.session_state.setdefault("editor_open", False)
+st.session_state.setdefault("last_update", None)
+
+
+def to_simple(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "item"):
+        return value.item()
+    return int(value)
 
 if st.button("🔄 Load Default Products"):
     data = client.get_default_products()
@@ -199,22 +202,31 @@ if st.session_state.products:
         st.info("Load products to enable the attribute editor.")
     else:
         if st.session_state.selected_product_id not in editable_skus:
-            st.session_state.selected_product_id = editable_skus[0]
+            st.session_state["selected_product_id"] = to_simple(editable_skus[0])
+
+        try:
+            current_index = editable_skus.index(st.session_state.selected_product_id)
+        except ValueError:
+            current_index = 0
 
         selected_product_id = st.selectbox(
             "Product to edit",
             options=editable_skus,
-            index=editable_skus.index(st.session_state.selected_product_id),
-            key="selected_product_id",
+            index=current_index,
+            key="selected_product_selector",
             help="Choose which SKU to edit attributes for.",
         )
+
+        selected_product_id = to_simple(selected_product_id)
+        if selected_product_id != st.session_state.selected_product_id:
+            st.session_state["selected_product_id"] = selected_product_id
 
         open_editor = st.button(
             "Open attribute editor", disabled=not bool(selected_product_id)
         )
-        if open_editor and selected_product_id:
-            st.session_state.editor_open = True
-            st.session_state.selected_product_id = selected_product_id
+        if open_editor and selected_product_id is not None:
+            st.session_state["editor_open"] = True
+            st.session_state["selected_product_id"] = selected_product_id
 
         if st.session_state.editor_open and st.session_state.selected_product_id:
             sku = st.session_state.selected_product_id
@@ -291,6 +303,7 @@ if st.session_state.products:
                     }
 
                     view_placeholder = st.empty()
+                    update_placeholder = st.empty()
 
                     def render_view_table(current_values: Dict[str, str]):
                         view_rows = []
@@ -345,6 +358,29 @@ if st.session_state.products:
                             )
 
                     render_view_table(curr)
+
+                    def render_update_report():
+                        update_placeholder.empty()
+                        last_update = st.session_state.get("last_update") or {}
+                        if last_update.get("sku") != sku:
+                            return
+                        status = last_update.get("status") or "info"
+                        with update_placeholder.container():
+                            if status == "success":
+                                st.success(f"Attributes saved for {sku}")
+                            elif status == "error":
+                                st.error(f"Failed to update {sku}")
+                            else:
+                                st.info(f"Update status for {sku}")
+                            st.json(
+                                {
+                                    "request": last_update.get("request"),
+                                    "diff": last_update.get("diff"),
+                                    "response": last_update.get("response"),
+                                }
+                            )
+
+                    render_update_report()
 
                     def _looks_like_float(candidate: str) -> bool:
                         try:
@@ -470,8 +506,8 @@ if st.session_state.products:
                             f"💾 Save attributes for {sku}"
                         )
                         if submitted:
-                            st.session_state.editor_open = True
-                            st.session_state.selected_product_id = sku
+                            st.session_state["editor_open"] = True
+                            st.session_state["selected_product_id"] = to_simple(sku)
 
                             cleaned_values = {
                                 code: normalise_value(val)
@@ -522,6 +558,7 @@ if st.session_state.products:
                                                 "body": body,
                                             },
                                         }
+                                        render_update_report()
                                     except Exception as exc:
                                         st.error(f"Failed to save: {exc}")
                                         st.session_state.last_update = {
@@ -530,6 +567,7 @@ if st.session_state.products:
                                             "request": payload,
                                             "response": {"error": str(exc)},
                                         }
+                                        render_update_report()
                                     else:
                                         st.toast(f"Attributes saved for {sku}")
                                         st.success("Saved to Magento.")
@@ -541,13 +579,6 @@ if st.session_state.products:
                                             for code, value in cleaned_values.items()
                                             if curr.get(code) != value
                                         }
-                                        st.json(
-                                            {
-                                                "request": payload,
-                                                "diff": diff,
-                                                "response": response,
-                                            }
-                                        )
                                         st.session_state.last_update = {
                                             "sku": sku,
                                             "status": "success",
@@ -576,6 +607,7 @@ if st.session_state.products:
                                                 break
 
                                         render_view_table(curr)
+                                        render_update_report()
 
         if st.session_state.last_update:
             with st.expander("Last update payload", expanded=False):
