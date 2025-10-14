@@ -116,28 +116,38 @@ if st.session_state.products:
         if set_id in allowed_codes_cache:
             return allowed_codes_cache[set_id]
 
-        # Прямо берём атрибуты всего набора — стабильнее, чем собирать по группам.
-        try:
-            attrs = client.get_attributes_for_set(set_id) or []
-        except Exception as exc:
-            st.warning(f"Failed to load attributes for set {set_id}: {exc}")
-            allowed_codes_cache[set_id] = set()
-            return set()
-
         allowed: Set[str] = set()
-        for attr in attrs:
-            code = (attr.get("attribute_code") or attr.get("code") or "").strip()
-            if not code:
-                continue
-            # сохраняем только пользовательские/видимые атрибуты, системные пропускаем
-            if attr.get("is_user_defined", True) is False:
-                continue
-            allowed.add(code)
 
-        # если API ничего не вернуло — не фильтруем, чтобы не скрыть полезные данные
+        try:
+            groups = client.get_attribute_groups(set_id) or []
+        except Exception as exc:
+            st.warning(f"Failed to load attribute groups for set {set_id}: {exc}")
+            groups = []
+
+        for group in groups:
+            gid = group.get("attribute_group_id") or group.get("id") or group.get("group_id")
+            if not gid:
+                continue
+            try:
+                attrs = client.get_attributes_for_group(set_id, gid) or []
+            except Exception:
+                continue
+            for attr in attrs:
+                code = (attr.get("attribute_code") or attr.get("code") or "").strip()
+                if code:
+                    allowed.add(code)
+
         if not allowed:
-            allowed_codes_cache[set_id] = set()
-            return set()
+            try:
+                attrs = client.get_attributes_for_set(set_id) or []
+            except Exception as exc:
+                st.warning(f"Failed to load attributes for set {set_id}: {exc}")
+                allowed_codes_cache[set_id] = set()
+                return set()
+            for attr in attrs:
+                code = (attr.get("attribute_code") or attr.get("code") or "").strip()
+                if code:
+                    allowed.add(code)
 
         allowed_codes_cache[set_id] = allowed
         return allowed

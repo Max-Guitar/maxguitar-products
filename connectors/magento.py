@@ -84,18 +84,27 @@ class MagentoClient:
         raise RuntimeError("Failed to fetch attribute sets via all known endpoints") from last_err
 
     def get_attribute_groups(self, attribute_set_id: Union[int, str]) -> List[Dict[str, Any]]:
-        """Return attribute groups for the given attribute set."""
+        """Return attribute groups for the given attribute set.
 
-        params = {
-            "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
-            "searchCriteria[filter_groups][0][filters][0][value]": str(attribute_set_id),
-            "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
-            "searchCriteria[pageSize]": 500,
-        }
-        data = self.get("products/attribute-sets/groups/list", params=params)
+        We try the modern `/products/attribute-sets/{setId}/groups` endpoint first
+        and gracefully fall back to the search-based variant if necessary."""
+
+        try:
+            data = self.get(f"products/attribute-sets/{attribute_set_id}/groups")
+        except (RetryError, httpx.HTTPStatusError):
+            params = {
+                "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
+                "searchCriteria[filter_groups][0][filters][0][value]": str(attribute_set_id),
+                "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+                "searchCriteria[pageSize]": 500,
+            }
+            data = self.get("products/attribute-sets/groups/list", params=params)
         items: Iterable[Dict[str, Any]]
         if isinstance(data, dict):
-            items = data.get("items", []) or []
+            if "items" in data:
+                items = data.get("items", []) or []
+            else:
+                items = []
         else:
             items = data or []
         return list(items)
