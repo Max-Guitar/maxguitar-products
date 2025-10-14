@@ -1,6 +1,7 @@
 """HTTP client helpers for interacting with Magento's REST API."""
 
 from functools import lru_cache
+from urllib.parse import quote
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -40,6 +41,12 @@ class MagentoClient:
             "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
         }
         return self.get("products", params=search)
+
+    def get_product(self, sku):
+        """Return a single product by SKU, ensuring the SKU is safe for URL usage."""
+
+        encoded_sku = quote(str(sku), safe="")
+        return self.get(f"products/{encoded_sku}")
 
     @lru_cache(maxsize=1)
     def get_attribute_sets(self):
