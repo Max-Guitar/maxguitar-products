@@ -30,50 +30,81 @@ if st.button("🔄 Load Default Products"):
     st.success(f"Loaded {len(st.session_state.products)} products")
 
 if st.session_state.products:
-    attribute_sets = client.get_attribute_sets()
-    attribute_names_to_id = {name: attr_id for attr_id, name in attribute_sets.items()}
+    set_name_by_id = {}
+    try:
+        set_name_by_id = client.get_attribute_sets()
+    except Exception as e:
+        st.warning(f"Couldn't load Attribute Sets ({e}); editing by set name will be disabled.")
+
+    name_to_id = {name: set_id for set_id, name in set_name_by_id.items()}
 
     for product in st.session_state.products:
+        raw_set_id = product.get("attribute_set_id")
         try:
-            set_id = int(product["attribute_set_id"])
+            set_id = int(raw_set_id)
         except (TypeError, ValueError):
             set_id = None
-        product["attribute_set_name"] = attribute_sets.get(set_id, "Unknown") if set_id is not None else "Unknown"
+        product["attribute_set_id"] = set_id
+        if set_id is None:
+            product["attribute_set_name"] = "Unknown"
+        elif set_name_by_id:
+            product["attribute_set_name"] = set_name_by_id.get(set_id, str(set_id))
+        else:
+            product["attribute_set_name"] = str(set_id)
 
     df = pd.DataFrame([
         {
             "sku": p["sku"],
             "name": p["name"],
+            "attribute_set_id": p.get("attribute_set_id"),
             "attribute_set_name": p.get("attribute_set_name", "Unknown"),
             "created_at": p["created_at"],
         }
         for p in st.session_state.products
     ])
 
-    editable_df = st.data_editor(
-        df,
-        column_config={
-            "attribute_set_name": st.column_config.SelectboxColumn(options=list(attribute_sets.values()))
-        },
-        key="editable_products",
-    )
+    if set_name_by_id:
+        editable_df = st.data_editor(
+            df,
+            column_config={
+                "attribute_set_name": st.column_config.SelectboxColumn(
+                    options=sorted(set_name_by_id.values())
+                )
+            },
+            hide_index=True,
+            key="editable_products",
+        )
 
-    if isinstance(editable_df, pd.DataFrame):
-        current_df = editable_df
-    elif editable_df is not None:
-        current_df = pd.DataFrame(editable_df)
+        if isinstance(editable_df, pd.DataFrame):
+            current_df = editable_df
+        elif editable_df is not None:
+            current_df = pd.DataFrame(editable_df)
+        else:
+            current_df = df
     else:
+        st.dataframe(df)
         current_df = df
 
     edited_records = current_df.to_dict("records")
 
-    name_by_sku = {row.get("sku"): row.get("attribute_set_name", "Unknown") for row in edited_records if row.get("sku")}
+    name_by_sku = {
+        row.get("sku"): row.get("attribute_set_name", "Unknown")
+        for row in edited_records
+        if row.get("sku")
+    }
 
     for product in st.session_state.products:
         selected_name = name_by_sku.get(product["sku"], product.get("attribute_set_name", "Unknown"))
         product["attribute_set_name"] = selected_name
-        if selected_name in attribute_names_to_id:
-            product["attribute_set_id"] = attribute_names_to_id[selected_name]
+        if set_name_by_id:
+            new_set_id = name_to_id.get(selected_name)
+            if new_set_id is not None:
+                product["attribute_set_id"] = new_set_id
+        else:
+            try:
+                product["attribute_set_id"] = int(selected_name)
+            except (TypeError, ValueError):
+                pass
 
     selected_skus = st.multiselect("Select SKUs to enrich", current_df["sku"])
     hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")
@@ -87,8 +118,13 @@ if st.session_state.products:
                 continue
             attr_set_id = product.get("attribute_set_id")
             attr_set_name = product.get("attribute_set_name")
-            if attr_set_name and attr_set_name in attribute_names_to_id:
-                attr_set_id = attribute_names_to_id[attr_set_name]
+            if set_name_by_id and attr_set_name in name_to_id:
+                attr_set_id = name_to_id[attr_set_name]
+            elif attr_set_id is None and attr_set_name:
+                try:
+                    attr_set_id = int(attr_set_name)
+                except (TypeError, ValueError):
+                    attr_set_id = None
             try:
                 specs = extract_attributes(product["name"], hint)
                 normalized = {k: normalize_value(k, str(v)) for k, v in specs.items()}

@@ -43,16 +43,44 @@ class MagentoClient:
 
     @lru_cache(maxsize=1)
     def get_attribute_sets(self):
-        """Return a cached mapping of attribute set id -> name."""
-        data = self.get("products/attribute-sets/setsList", params={"searchCriteria[current_page]": 1})
-        sets = {int(item["attribute_set_id"]): item["attribute_set_name"] for item in data.get("items", [])}
-        return sets
+        """Return a cached mapping of attribute set id -> name using robust endpoint discovery."""
+
+        candidates = [
+            ("products/attribute-sets/sets/list", {"searchCriteria[pageSize]": 200}),
+            ("eav/attribute-sets/list", {"searchCriteria[pageSize]": 200}),
+            ("products/attribute-sets/list", {"searchCriteria[pageSize]": 200}),
+            ("products/attribute-sets/setsList", {"searchCriteria[current_page]": 1}),
+        ]
+        last_err = None
+
+        for endpoint, params in candidates:
+            try:
+                data = self.get(endpoint, params=params)
+            except Exception as exc:  # pragma: no cover - defensive against Magento variants
+                last_err = exc
+                continue
+
+            items = data.get("items", data) if isinstance(data, dict) else data
+            sets = {}
+            for item in items or []:
+                try:
+                    set_id = int(item.get("attribute_set_id") or item.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                name = item.get("attribute_set_name") or item.get("name")
+                if set_id and name:
+                    sets[set_id] = name
+            if sets:
+                return sets
+
+        raise RuntimeError("Failed to fetch attribute sets via all known endpoints") from last_err
 
     def get_attributes_for_set(self, set_id):
         """Return all attributes associated with a specific attribute set."""
         params = {
             "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
-            "searchCriteria[filter_groups][0][filters][0][value]": set_id,
+            "searchCriteria[filter_groups][0][filters][0][value]": str(set_id),
+            "searchCriteria[pageSize]": 500,
         }
         data = self.get("products/attributes", params=params)
         return data.get("items", [])
