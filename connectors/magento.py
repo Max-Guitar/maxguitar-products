@@ -124,6 +124,24 @@ class MagentoClient:
             items = data or []
         return list(items)
 
+    def get_attributes_for_group(
+        self, attribute_set_id: Union[int, str], group_id: Union[int, str]
+    ) -> List[Dict[str, Any]]:
+        """Return attributes belonging to a specific attribute group.
+
+        Some Magento endpoints only need the group identifier in the path, but we
+        keep the attribute set id in the signature for clarity and potential
+        future validation.
+        """
+
+        data = self.get(f"products/attribute-sets/groups/{group_id}/attributes")
+        items: Iterable[Dict[str, Any]]
+        if isinstance(data, dict):
+            items = data.get("items", []) or []
+        else:
+            items = data or []
+        return list(items)
+
     def get_attribute(self, attribute_code: Union[int, str]) -> Dict[str, Any]:
         """Return metadata for a single attribute."""
 
