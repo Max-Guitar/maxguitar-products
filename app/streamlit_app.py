@@ -43,10 +43,17 @@ if st.session_state.products:
             product = next((p for p in st.session_state.products if p["sku"] == sku), None)
             if not product:
                 continue
-            specs = extract_attributes(product["name"], hint)
-            results.append({"sku": sku, **specs})
-        st.session_state.generated = pd.DataFrame(results)
-        st.dataframe(st.session_state.generated)
+            try:
+                specs = extract_attributes(product["name"], hint)
+                normalized = {k: normalize_value(k, str(v)) for k, v in specs.items()}
+                results.append({"sku": sku, **normalized})
+            except Exception as e:
+                st.warning(f"Failed to extract for {sku}: {e}")
+        if results:
+            st.session_state.generated = pd.DataFrame(results)
+            st.dataframe(st.session_state.generated)
+        else:
+            st.info("No specs generated.")
 
     if "generated" in st.session_state:
         st.subheader("Review & Apply Changes")
