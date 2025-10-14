@@ -540,27 +540,42 @@ if st.session_state.products:
                                         response = apply_product_update(
                                             sku, cleaned_values
                                         )
+                                        st.toast("✅ Attributes saved successfully")
+                                        st.json(response)
                                     except httpx.HTTPStatusError as exc:
-                                        resp = exc.response
-                                        status_code = (
-                                            resp.status_code if resp is not None else "?"
+                                        status_code = getattr(
+                                            exc.response, "status_code", "?"
                                         )
-                                        body = resp.text if resp is not None else str(exc)
+                                        request_url = getattr(
+                                            exc.request, "url", "Unknown URL"
+                                        )
                                         st.error(
-                                            f"Magento returned {status_code}: {body}"
+                                            f"❌ Failed to save attributes: {status_code} {request_url}"
                                         )
+                                        if getattr(exc, "request", None) is not None:
+                                            st.write(
+                                                "Request body:",
+                                                getattr(exc.request, "content", None),
+                                            )
+                                        if getattr(exc, "response", None) is not None:
+                                            st.write(
+                                                "Response text:",
+                                                getattr(exc.response, "text", None),
+                                            )
                                         st.session_state.last_update = {
                                             "sku": sku,
                                             "status": "error",
                                             "request": payload,
                                             "response": {
                                                 "status_code": status_code,
-                                                "body": body,
+                                                "body": getattr(
+                                                    exc.response, "text", None
+                                                ),
                                             },
                                         }
                                         render_update_report()
                                     except Exception as exc:
-                                        st.error(f"Failed to save: {exc}")
+                                        st.error(f"Unexpected error: {exc}")
                                         st.session_state.last_update = {
                                             "sku": sku,
                                             "status": "error",
@@ -569,7 +584,6 @@ if st.session_state.products:
                                         }
                                         render_update_report()
                                     else:
-                                        st.toast(f"Attributes saved for {sku}")
                                         st.success("Saved to Magento.")
                                         diff = {
                                             code: {
