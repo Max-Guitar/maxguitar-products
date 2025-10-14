@@ -1,6 +1,7 @@
 """HTTP client helpers for interacting with Magento's REST API."""
 
 from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Union
 from urllib.parse import quote
 
 import httpx
@@ -42,7 +43,7 @@ class MagentoClient:
         }
         return self.get("products", params=search)
 
-    def get_product(self, sku):
+    def get_product(self, sku: Union[int, str]) -> Dict[str, Any]:
         """Return a single product by SKU, ensuring the SKU is safe for URL usage."""
 
         encoded_sku = quote(str(sku), safe="")
@@ -82,15 +83,61 @@ class MagentoClient:
 
         raise RuntimeError("Failed to fetch attribute sets via all known endpoints") from last_err
 
-    def get_attributes_for_set(self, set_id):
-        """Return all attributes associated with a specific attribute set."""
+    def get_attribute_groups(self, attribute_set_id: Union[int, str]) -> List[Dict[str, Any]]:
+        """Return attribute groups for the given attribute set."""
+
         params = {
             "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
-            "searchCriteria[filter_groups][0][filters][0][value]": str(set_id),
+            "searchCriteria[filter_groups][0][filters][0][value]": str(attribute_set_id),
+            "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
             "searchCriteria[pageSize]": 500,
         }
-        data = self.get("products/attributes", params=params)
-        return data.get("items", [])
+        data = self.get("products/attribute-sets/groups/list", params=params)
+        items: Iterable[Dict[str, Any]]
+        if isinstance(data, dict):
+            items = data.get("items", []) or []
+        else:
+            items = data or []
+        return list(items)
+
+    def get_attributes_for_set(self, set_id: Union[int, str]) -> List[Dict[str, Any]]:
+        """Return all attributes associated with a specific attribute set.
+
+        Magento instances can expose this information via different endpoints. We
+        attempt the modern attribute-set endpoint first and gracefully fall back
+        to the legacy search-based endpoint if necessary.
+        """
+
+        try:
+            data = self.get(f"products/attribute-sets/{set_id}/attributes")
+        except Exception:  # pragma: no cover - compatibility with Magento variants
+            params = {
+                "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
+                "searchCriteria[filter_groups][0][filters][0][value]": str(set_id),
+                "searchCriteria[pageSize]": 500,
+            }
+            data = self.get("products/attributes", params=params)
+        items: Iterable[Dict[str, Any]]
+        if isinstance(data, dict):
+            items = data.get("items", []) or []
+        else:
+            items = data or []
+        return list(items)
+
+    def get_attribute(self, attribute_code: Union[int, str]) -> Dict[str, Any]:
+        """Return metadata for a single attribute."""
+
+        encoded_code = quote(str(attribute_code), safe="")
+        return self.get(f"products/attributes/{encoded_code}")
+
+    def get_attribute_options(self, attribute_code: Union[int, str]) -> List[Dict[str, Any]]:
+        """Return dropdown/options metadata for a given attribute."""
+
+        encoded_code = quote(str(attribute_code), safe="")
+        data = self.get(f"products/attributes/{encoded_code}/options")
+        if isinstance(data, dict):
+            return list(data.get("items", []) or [])
+        return list(data or [])
 
 
 client = MagentoClient()
