@@ -1,5 +1,7 @@
 """HTTP client helpers for interacting with Magento's REST API."""
 
+from functools import lru_cache
+
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
@@ -38,6 +40,22 @@ class MagentoClient:
             "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
         }
         return self.get("products", params=search)
+
+    @lru_cache(maxsize=1)
+    def get_attribute_sets(self):
+        """Return a cached mapping of attribute set id -> name."""
+        data = self.get("products/attribute-sets/setsList", params={"searchCriteria[current_page]": 1})
+        sets = {int(item["attribute_set_id"]): item["attribute_set_name"] for item in data.get("items", [])}
+        return sets
+
+    def get_attributes_for_set(self, set_id):
+        """Return all attributes associated with a specific attribute set."""
+        params = {
+            "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
+            "searchCriteria[filter_groups][0][filters][0][value]": set_id,
+        }
+        data = self.get("products/attributes", params=params)
+        return data.get("items", [])
 
 
 client = MagentoClient()
