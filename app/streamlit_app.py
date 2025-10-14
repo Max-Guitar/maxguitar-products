@@ -2,9 +2,10 @@
 
 import sys
 from pathlib import Path
+from typing import Dict, Set
 
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -12,6 +13,8 @@ if str(ROOT) not in sys.path:
 
 from connectors.magento import client
 from services.apply import apply_product_update
+from services.llm_extract import extract_attributes
+from services.normalize import normalize_value
 
 st.set_page_config(page_title="Magento Product Enricher", layout="wide")
 
@@ -105,6 +108,97 @@ if st.session_state.products:
     selected_skus = st.multiselect("Select SKUs", current_df["sku"])
     hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")  # пока не используем
 
+    allowed_codes_cache: Dict[int, Set[str]] = {}
+
+    def fetch_allowed_codes_for_set(set_id: int | None) -> Set[str]:
+        if set_id is None:
+            return set()
+        if set_id in allowed_codes_cache:
+            return allowed_codes_cache[set_id]
+
+        allowed: Set[str] = set()
+        try:
+            groups_resp = client.get_attribute_groups(set_id)
+        except Exception as exc:
+            st.warning(f"Failed to load attribute groups for set {set_id}: {exc}")
+            groups_resp = []
+        if isinstance(groups_resp, dict):
+            groups = groups_resp.get("items", []) or []
+        else:
+            groups = groups_resp or []
+        for group in groups:
+            group_id = (
+                group.get("attribute_group_id")
+                or group.get("group_id")
+                or group.get("id")
+            )
+            if not group_id:
+                continue
+            try:
+                attrs = client.get_attributes_for_group(set_id, group_id)
+            except Exception as exc:
+                st.warning(
+                    f"Failed to load attributes for group {group_id} in set {set_id}: {exc}"
+                )
+                continue
+            for attr in attrs or []:
+                code = attr.get("attribute_code") or attr.get("code")
+                if code:
+                    allowed.add(code)
+
+        if not allowed:
+            try:
+                attrs = client.get_attributes_for_set(set_id)
+            except Exception as exc:
+                st.warning(f"Failed to load attributes for set {set_id}: {exc}")
+                attrs = []
+            for attr in attrs or []:
+                code = attr.get("attribute_code") or attr.get("code")
+                if code:
+                    allowed.add(code)
+
+        allowed_codes_cache[set_id] = allowed
+        return allowed
+
+    if st.button("✨ Generate Specs"):
+        if not selected_skus:
+            st.info("Select at least one SKU.")
+        else:
+            results = []
+            for sku in selected_skus:
+                product = next(
+                    (p for p in st.session_state.products if p.get("sku") == sku),
+                    None,
+                )
+                if not product:
+                    st.warning(f"SKU {sku} is not loaded anymore; skipping.")
+                    continue
+                try:
+                    specs = extract_attributes(product.get("name", ""), hint)
+                except Exception as exc:
+                    st.warning(f"Failed to extract specs for {sku}: {exc}")
+                    continue
+                normalized = {
+                    code: normalize_value(code, str(value))
+                    for code, value in (specs or {}).items()
+                }
+                raw_set_id = product.get("attribute_set_id")
+                try:
+                    set_id = int(raw_set_id)
+                except (TypeError, ValueError):
+                    set_id = None
+                allowed_codes = fetch_allowed_codes_for_set(set_id)
+                filtered = {
+                    code: val
+                    for code, val in normalized.items()
+                    if not allowed_codes or code in allowed_codes
+                }
+                results.append({"sku": sku, **filtered})
+            if results:
+                st.dataframe(pd.DataFrame(results))
+            else:
+                st.info("No specs generated yet. Try adjusting the hint or selection.")
+
     target_groups = {
         "General": {"only_codes": {"brand"}},
         "Filters": {"only_codes": None},
@@ -112,7 +206,7 @@ if st.session_state.products:
         "Content": {"only_codes": {"short_description"}},
     }
 
-    def fetch_attr_meta_for_set(set_id: int):
+    def fetch_target_group_meta_for_set(set_id: int):
         groups = client.get_attribute_groups(set_id)
         name_to_id = {g["attribute_group_name"]: g["attribute_group_id"] for g in groups}
         meta = {}
@@ -135,7 +229,7 @@ if st.session_state.products:
                 }
         return meta
 
-    attr_cache = {}  # set_id -> meta
+    attr_meta_cache = {}  # set_id -> meta
 
     if st.button("🔎 Get Specs"):
         if not selected_skus:
@@ -155,9 +249,9 @@ if st.session_state.products:
                     except (TypeError, ValueError):
                         st.warning("Attribute set is missing for this product; cannot load attributes.")
                         continue
-                    if set_id not in attr_cache:
-                        attr_cache[set_id] = fetch_attr_meta_for_set(set_id)
-                    meta = attr_cache[set_id]
+                    if set_id not in attr_meta_cache:
+                        attr_meta_cache[set_id] = fetch_target_group_meta_for_set(set_id)
+                    meta = attr_meta_cache[set_id]
                     curr = {
                         attr["attribute_code"]: attr.get("value")
                         for attr in prod_full.get("custom_attributes", [])
