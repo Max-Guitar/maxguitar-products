@@ -127,8 +127,15 @@ class MagentoClient:
             }
             data = self.get("products/attributes", params=params)
         items: Iterable[Dict[str, Any]]
+
         if isinstance(data, dict):
-            items = data.get("items", []) or []
+            for key in ("items", "attribute_set_attributes", "attributeSetAttributes"):
+                if key in data:
+                    candidate = data.get(key) or []
+                    break
+            else:
+                candidate = []
+            items = candidate
         else:
             items = data or []
         return list(items)
@@ -138,7 +145,13 @@ class MagentoClient:
 
         data = self.get("products/attributes")
         if isinstance(data, dict):
-            return list(data.get("items", []) or [])
+            for key in ("items", "attributes", "attribute_list"):
+                if key in data:
+                    candidate = data.get(key) or []
+                    break
+            else:
+                candidate = []
+            return list(candidate)
         return list(data or [])
 
     def get_attributes_for_group(
