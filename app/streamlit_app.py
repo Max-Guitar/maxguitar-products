@@ -116,47 +116,28 @@ if st.session_state.products:
         if set_id in allowed_codes_cache:
             return allowed_codes_cache[set_id]
 
-        allowed: Set[str] = set()
+        # Прямо берём атрибуты всего набора — стабильнее, чем собирать по группам.
         try:
-            groups_resp = client.get_attribute_groups(set_id)
+            attrs = client.get_attributes_for_set(set_id) or []
         except Exception as exc:
-            st.warning(f"Failed to load attribute groups for set {set_id}: {exc}")
-            groups_resp = []
-        if isinstance(groups_resp, dict):
-            groups = groups_resp.get("items", []) or []
-        else:
-            groups = groups_resp or []
-        for group in groups:
-            group_id = (
-                group.get("attribute_group_id")
-                or group.get("group_id")
-                or group.get("id")
-            )
-            if not group_id:
-                continue
-            try:
-                attrs = client.get_attributes_for_group(set_id, group_id) or []
-            except Exception as exc:
-                st.warning(
-                    f"Failed to load attributes for group {group_id} in set {set_id}: {exc}"
-                )
-                continue
-            for attr in attrs:
-                code = attr.get("attribute_code") or attr.get("code")
-                if code:
-                    allowed.add(code)
+            st.warning(f"Failed to load attributes for set {set_id}: {exc}")
+            allowed_codes_cache[set_id] = set()
+            return set()
 
+        allowed: Set[str] = set()
+        for attr in attrs:
+            code = (attr.get("attribute_code") or attr.get("code") or "").strip()
+            if not code:
+                continue
+            # сохраняем только пользовательские/видимые атрибуты, системные пропускаем
+            if attr.get("is_user_defined", True) is False:
+                continue
+            allowed.add(code)
+
+        # если API ничего не вернуло — не фильтруем, чтобы не скрыть полезные данные
         if not allowed:
-            # Fallback: when groups are missing or empty, use the entire attribute set.
-            try:
-                attrs = client.get_attributes_for_set(set_id)
-            except Exception as exc:
-                st.warning(f"Failed to load attributes for set {set_id}: {exc}")
-                attrs = []
-            for attr in attrs or []:
-                code = attr.get("attribute_code") or attr.get("code")
-                if code:
-                    allowed.add(code)
+            allowed_codes_cache[set_id] = set()
+            return set()
 
         allowed_codes_cache[set_id] = allowed
         return allowed
@@ -192,6 +173,7 @@ if st.session_state.products:
                 filtered = {
                     code: val
                     for code, val in normalized.items()
+                    # если список пуст, оставляем все значения
                     if not allowed_codes or code in allowed_codes
                 }
                 results.append({"sku": sku, **filtered})
