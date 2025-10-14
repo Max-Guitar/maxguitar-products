@@ -134,7 +134,12 @@ class MagentoClient:
         future validation.
         """
 
-        data = self.get(f"products/attribute-sets/groups/{group_id}/attributes")
+        try:
+            data = self.get(f"products/attribute-sets/groups/{group_id}/attributes")
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (400, 404):
+                return []
+            raise
         items: Iterable[Dict[str, Any]]
         if isinstance(data, dict):
             items = data.get("items", []) or []

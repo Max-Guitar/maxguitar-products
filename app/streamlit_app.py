@@ -135,18 +135,19 @@ if st.session_state.products:
             if not group_id:
                 continue
             try:
-                attrs = client.get_attributes_for_group(set_id, group_id)
+                attrs = client.get_attributes_for_group(set_id, group_id) or []
             except Exception as exc:
                 st.warning(
                     f"Failed to load attributes for group {group_id} in set {set_id}: {exc}"
                 )
                 continue
-            for attr in attrs or []:
+            for attr in attrs:
                 code = attr.get("attribute_code") or attr.get("code")
                 if code:
                     allowed.add(code)
 
         if not allowed:
+            # Fallback: when groups are missing or empty, use the entire attribute set.
             try:
                 attrs = client.get_attributes_for_set(set_id)
             except Exception as exc:
