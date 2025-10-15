@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import ast
+import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional
 
+import httpx
+
 from connectors.magento import client
+
+
+logger = logging.getLogger(__name__)
 
 
 def _looks_like_float(candidate: str) -> bool:
@@ -180,13 +186,21 @@ def normalise_attribute_value(
             trimmed = value.strip()
             if not trimmed:
                 return None
-            if trimmed.lower().startswith("container"):
-                return trimmed
-            if re.fullmatch(r"-?\d+", trimmed):
-                return f"container{int(trimmed)}"
+            lowered = trimmed.lower()
+            if lowered.startswith("container"):
+                return lowered
+            if re.fullmatch(r"\d+", trimmed):
+                return f"container{trimmed}"
             return trimmed
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return f"container{int(value)}"
+            if isinstance(value, float):
+                if value.is_integer():
+                    number_str = format(value, ".0f")
+                else:
+                    number_str = format(value, "g")
+            else:
+                number_str = str(value)
+            return f"container{number_str}"
         return str(value)
     if code == "category_ids":
         return _normalise_int_list(value)
@@ -208,9 +222,8 @@ def build_product_payload(
     """Return a Magento product payload respecting attribute types."""
 
     metadata = metadata or {}
-    product: Dict[str, Any] = {"sku": sku}
-    extension_attributes: Dict[str, Any] = {}
     custom_attributes: List[Dict[str, Any]] = []
+    category_links: List[Dict[str, str]] = []
 
     for code, raw_value in attributes.items():
         attr_meta = metadata.get(code, {})
@@ -223,8 +236,6 @@ def build_product_payload(
             category_links = [
                 {"category_id": str(category_id)} for category_id in normalised
             ]
-            if category_links:
-                extension_attributes["category_links"] = category_links
             continue
         if code == "quantity_and_stock_status":
             continue
@@ -236,7 +247,12 @@ def build_product_payload(
                     f"Attribute '{code}' must be a list of integers for multiselect"
                 )
         elif attr_meta.get("input", "").lower() == "select":
-            if not isinstance(normalised, int):
+            if code == "options_container":
+                if not isinstance(normalised, str):
+                    raise ValueError(
+                        "Attribute 'options_container' must be a string for select"
+                    )
+            elif not isinstance(normalised, int):
                 raise ValueError(f"Attribute '{code}' must be an integer for select")
         elif attr_meta.get("input", "").lower() in {"boolean", "bool"}:
             if normalised not in {0, 1}:
@@ -245,11 +261,11 @@ def build_product_payload(
                 )
         custom_attributes.append({"attribute_code": code, "value": normalised})
 
-    if extension_attributes:
-        product["extension_attributes"] = extension_attributes
-
-    if custom_attributes:
-        product["custom_attributes"] = custom_attributes
+    product: Dict[str, Any] = {
+        "sku": sku,
+        "custom_attributes": custom_attributes,
+        "extension_attributes": {"category_links": category_links},
+    }
 
     return {"product": product}
 
@@ -266,8 +282,25 @@ def apply_product_update(
     # whether a pre-built payload has been supplied.
     final_payload = build_product_payload(sku, attributes, metadata)
 
-    patch_func = getattr(client.patch, "__wrapped__", None)
-    if callable(patch_func):
-        return patch_func(client, f"products/{sku}", final_payload)
+    logger.info("Sending product update", extra={"sku": sku, "payload": final_payload})
 
-    return client.patch(f"products/{sku}", final_payload)
+    patch_func = getattr(client.patch, "__wrapped__", None)
+    try:
+        if callable(patch_func):
+            response = patch_func(client, f"products/{sku}", final_payload)
+        else:
+            response = client.patch(f"products/{sku}", final_payload)
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "Magento update failed",
+            extra={
+                "sku": sku,
+                "payload": final_payload,
+                "status_code": getattr(exc.response, "status_code", None),
+                "response_text": getattr(exc.response, "text", None),
+            },
+        )
+        raise
+
+    logger.info("Magento update succeeded", extra={"sku": sku, "response": response})
+    return response

@@ -31,6 +31,7 @@ st.session_state.setdefault("product_details", {})
 st.session_state.setdefault("selected_product_id", None)
 st.session_state.setdefault("editor_open", False)
 st.session_state.setdefault("last_update", None)
+st.session_state.setdefault("generated", {})
 
 
 def to_simple(value):
@@ -506,6 +507,7 @@ if st.session_state.products:
                                         f"Failed to build product payload: {exc}"
                                     )
                                 else:
+                                    st.code(json.dumps(cleaned_values, indent=2))
                                     product_payload = payload.get("product", {})
                                     st.code(json.dumps(product_payload, indent=2))
 
@@ -517,7 +519,7 @@ if st.session_state.products:
                                                 meta,
                                                 payload=payload,
                                             )
-                                            st.toast("✅ Attributes saved successfully")
+                                            st.toast("Saved")
                                         except httpx.HTTPStatusError as exc:
                                             status_code = getattr(
                                                 exc.response, "status_code", None
@@ -582,6 +584,11 @@ if st.session_state.products:
                                                 for code, value in cleaned_values.items()
                                                 if curr.get(code) != value
                                             }
+                                            generated_map = st.session_state.get("generated", {})
+                                            generated_map.setdefault(sku, {}).update(
+                                                cleaned_values
+                                            )
+                                            st.session_state.generated = generated_map
                                             st.session_state.last_update = {
                                                 "sku": sku,
                                                 "status": "success",
