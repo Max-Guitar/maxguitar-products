@@ -200,7 +200,7 @@ def test_apply_product_update_regenerates_payload(monkeypatch: pytest.MonkeyPatc
     )
 
     response, mismatches, _ = apply_product_update(
-        "SKU123", diff, resolved, payload
+        "SKU123", diff, resolved
     )
 
     assert mismatches == {}

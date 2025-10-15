@@ -27,6 +27,9 @@ NON_EDITABLE_CODES = {
     "image",
     "small_image",
     "thumbnail",
+    "media_gallery",
+    "media_gallery_entries",
+    "stock_item",
 }
 
 _ATTRIBUTE_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -137,6 +140,37 @@ def _extract_category_ids(source: Optional[Dict[str, Any]]) -> list[int]:
     return result
 
 
+def _payload_from_diff(sku: Any, diff: Dict[str, Any]) -> Dict[str, Any]:
+    if not diff:
+        return {}
+
+    product: Dict[str, Any] = {"sku": sku, "custom_attributes": []}
+    extension_attributes: Dict[str, Any] = {}
+
+    category_ids = diff.get("category_ids")
+    if category_ids is not None:
+        extension_attributes["category_links"] = [
+            {"category_id": str(cid)} for cid in category_ids
+        ]
+
+    for code, value in diff.items():
+        if code in NON_EDITABLE_CODES or code == "category_ids":
+            continue
+        if value is None:
+            continue
+        product["custom_attributes"].append(
+            {"attribute_code": code, "value": value}
+        )
+
+    if extension_attributes:
+        product["extension_attributes"] = extension_attributes
+
+    if not product["custom_attributes"] and not extension_attributes:
+        return {}
+
+    return {"product": product}
+
+
 def build_product_payload(
     sku: Any,
     form_data: Dict[str, Any],
@@ -161,16 +195,32 @@ def build_product_payload(
         attr_meta = resolve_attribute_metadata(code, metadata.get(code, {}))
         resolved_meta[code] = attr_meta
 
+        fetcher = (
+            lambda requested_code, meta=attr_meta: meta if requested_code == code else {}
+        )
+
         try:
-            normalised_new = normalize_value(code, raw_value, attr_meta)
+            normalised_new = normalize_value(
+                code, raw_value, attr_meta, fetch_meta_func=fetcher
+            )
         except ValueError as exc:
             raise ValueError(f"{code}: {exc}") from exc
 
         if code == "category_ids" and not original_attributes.get(code):
             current_categories = _extract_category_ids(original_extension_attributes)
-            baseline = normalize_value(code, current_categories, attr_meta)
+            baseline = normalize_value(
+                code,
+                current_categories,
+                attr_meta,
+                fetch_meta_func=fetcher,
+            )
         else:
-            baseline = normalize_value(code, original_attributes.get(code), attr_meta)
+            baseline = normalize_value(
+                code,
+                original_attributes.get(code),
+                attr_meta,
+                fetch_meta_func=fetcher,
+            )
 
         if normalised_new is None or normalised_new == baseline:
             continue
@@ -184,41 +234,27 @@ def build_product_payload(
     if not diff:
         return diff, resolved_meta, {}
 
-    product: Dict[str, Any] = {"sku": sku, "custom_attributes": []}
-    extension_attributes: Dict[str, Any] = {}
-
-    category_ids = diff.get("category_ids")
-    if category_ids is not None:
-        extension_attributes["category_links"] = [
-            {"category_id": str(cid)} for cid in category_ids
-        ]
-
-    for code, value in diff.items():
-        if code in NON_EDITABLE_CODES or code == "category_ids":
-            continue
-        product["custom_attributes"].append({"attribute_code": code, "value": value})
-
-    if extension_attributes:
-        product["extension_attributes"] = extension_attributes
-
-    return diff, resolved_meta, {"product": product}
+    payload = _payload_from_diff(sku, diff)
+    return diff, resolved_meta, payload
 
 
 def apply_product_update(
     sku: Any,
     diff: Dict[str, Any],
-    resolved_metadata: Dict[str, Dict[str, Any]],
-    payload: Dict[str, Any],
+    resolved_metadata: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Any, Dict[str, Dict[str, Any]], Dict[str, Any]]:
     """Send the Magento update request and verify the resulting state."""
 
     if not diff:
         raise ValueError("No changes to apply")
 
-    product_payload = payload.get("product", {})
+    payload = _payload_from_diff(sku, diff)
+    if not payload:
+        raise ValueError("No payload to send for the provided diff")
+
     if st is not None:
         try:  # pragma: no cover - Streamlit optional during tests
-            st.code(json.dumps(product_payload, indent=2))
+            st.code(json.dumps(payload, indent=2))
         except Exception:
             pass
 
@@ -247,11 +283,26 @@ def apply_product_update(
                 "response_text": response_text,
             },
         )
+        if st is not None:
+            try:  # pragma: no cover - Streamlit optional during tests
+                message_lines = [
+                    "❌ Failed to save attributes:",
+                    f"Status: {status_code or '?'}",
+                    f"URL: {request_url}",
+                    "Request body:",
+                    request_body or "<empty request body>",
+                    "Response text:",
+                    response_text or "<empty response>",
+                ]
+                st.error("\n".join(message_lines))
+            except Exception:
+                pass
         raise
 
     logger.info("Magento update succeeded", extra={"sku": sku, "response": response})
 
     product_state = client.get_product(sku)
+    resolved_metadata = resolved_metadata or {}
     mismatches = _verify_diff(diff, product_state, resolved_metadata)
     return response, mismatches, product_state
 
@@ -273,7 +324,12 @@ def _verify_diff(
             raw_current = _extract_category_ids(extension_attrs)
         else:
             raw_current = current_attrs.get(code)
-        current_normalised = normalize_value(code, raw_current, attr_meta)
+        fetcher = (
+            lambda requested_code, meta=attr_meta: meta if requested_code == code else {}
+        )
+        current_normalised = normalize_value(
+            code, raw_current, attr_meta, fetch_meta_func=fetcher
+        )
         if current_normalised != expected:
             mismatches[code] = {
                 "expected": expected,
