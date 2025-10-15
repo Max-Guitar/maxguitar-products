@@ -21,6 +21,15 @@ os.environ.setdefault("OPENAI_API_KEY", "test-key")
 from services.apply import apply_product_update, build_product_payload
 
 
+@pytest.fixture(autouse=True)
+def mock_attribute_metadata(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        "services.apply.client.get_attribute",
+        lambda code: {"attribute_code": code},
+    )
+    monkeypatch.setattr("services.apply.client.get_attribute_options", lambda code: [])
+
+
 def _capture_patch(monkeypatch: pytest.MonkeyPatch):
     """Return a helper capturing payloads sent to the Magento client."""
 
@@ -40,25 +49,22 @@ def _capture_patch(monkeypatch: pytest.MonkeyPatch):
     ["__no_update__", "no_update", "   ", ""],
 )
 def test_custom_layout_update_file_sentinels_are_dropped(value: str):
-    payload = build_product_payload(
+    diff, _, payload = build_product_payload(
         "SKU123",
         {"custom_layout_update_file": value},
     )
 
-    assert payload == {
-        "product": {
-            "sku": "SKU123",
-            "custom_attributes": [],
-        }
-    }
+    assert diff == {}
+    assert payload == {}
 
 
 def test_custom_layout_update_file_passes_through_real_path():
-    payload = build_product_payload(
+    diff, _, payload = build_product_payload(
         "SKU123",
         {"custom_layout_update_file": "Magento/theme/layout.xml"},
     )
 
+    assert diff == {"custom_layout_update_file": "Magento/theme/layout.xml"}
     assert payload == {
         "product": {
             "sku": "SKU123",
@@ -73,7 +79,7 @@ def test_custom_layout_update_file_passes_through_real_path():
 
 
 def test_only_changed_attributes_are_sent():
-    payload = build_product_payload(
+    diff, _, payload = build_product_payload(
         "SKU123",
         {"options_container": "container2", "color": "5"},
         {
@@ -86,6 +92,7 @@ def test_only_changed_attributes_are_sent():
         },
     )
 
+    assert diff == {"color": 5}
     assert payload == {
         "product": {
             "sku": "SKU123",
@@ -97,7 +104,7 @@ def test_only_changed_attributes_are_sent():
 
 
 def test_static_attributes_and_media_are_dropped():
-    payload = build_product_payload(
+    diff, _, payload = build_product_payload(
         "SKU123",
         {
             "has_options": 1,
@@ -108,15 +115,17 @@ def test_static_attributes_and_media_are_dropped():
         },
     )
 
-    assert payload == {"product": {"sku": "SKU123", "custom_attributes": []}}
+    assert diff == {}
+    assert payload == {}
 
 
 def test_description_is_sanitised():
-    payload = build_product_payload(
+    diff, _, payload = build_product_payload(
         "SKU123",
         {"description": r"Line\\break \\value &amp;"},
     )
 
+    assert diff == {"description": "Linebreak value &"}
     assert payload == {
         "product": {
             "sku": "SKU123",
@@ -128,7 +137,7 @@ def test_description_is_sanitised():
 
 
 def test_category_links_are_strings():
-    payload = build_product_payload(
+    diff, _, payload = build_product_payload(
         "SKU123",
         {"category_ids": [1, 2]},
         original_extension_attributes={
@@ -138,6 +147,7 @@ def test_category_links_are_strings():
         },
     )
 
+    assert diff == {"category_ids": [1, 2]}
     assert payload == {
         "product": {
             "sku": "SKU123",
@@ -153,7 +163,7 @@ def test_category_links_are_strings():
 
 
 def test_category_links_not_sent_when_unchanged():
-    payload = build_product_payload(
+    diff, _, payload = build_product_payload(
         "SKU123",
         {"category_ids": [3]},
         original_extension_attributes={
@@ -163,38 +173,37 @@ def test_category_links_not_sent_when_unchanged():
         },
     )
 
-    assert payload == {"product": {"sku": "SKU123", "custom_attributes": []}}
+    assert diff == {}
+    assert payload == {}
 
 
 def test_apply_product_update_regenerates_payload(monkeypatch: pytest.MonkeyPatch):
     captured = _capture_patch(monkeypatch)
 
-    # Provide a pre-built payload that still includes the sentinel value – the
-    # helper should regenerate it to remove the attribute entirely.
-    prebuilt_payload = {
-        "product": {
+    def fake_get_product(_):
+        return {
             "sku": "SKU123",
             "custom_attributes": [
                 {
                     "attribute_code": "custom_layout_update_file",
-                    "value": "__no_update__",
+                    "value": "Magento/theme/layout.xml",
                 }
             ],
+            "extension_attributes": {},
         }
-    }
 
-    response = apply_product_update(
+    monkeypatch.setattr("services.apply.client.get_product", fake_get_product)
+
+    diff, resolved, payload = build_product_payload(
         "SKU123",
-        {"custom_layout_update_file": "__no_update__"},
-        metadata=None,
-        payload=prebuilt_payload,
+        {"custom_layout_update_file": "Magento/theme/layout.xml"},
     )
 
+    response, mismatches, _ = apply_product_update(
+        "SKU123", diff, resolved, payload
+    )
+
+    assert mismatches == {}
     assert response == {"status": "ok"}
     assert captured["endpoint"] == "products/SKU123"
-    assert captured["payload"] == {
-        "product": {
-            "sku": "SKU123",
-            "custom_attributes": [],
-        }
-    }
+    assert captured["payload"] == payload
