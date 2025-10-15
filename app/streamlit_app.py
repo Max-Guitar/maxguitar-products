@@ -29,6 +29,7 @@ st.title("🎸 Magento Product Enricher")
 st.session_state.setdefault("products", [])
 st.session_state.setdefault("product_details", {})
 st.session_state.setdefault("selected_product_id", None)
+st.session_state.setdefault("selected_skus", [])
 st.session_state.setdefault("editor_open", False)
 st.session_state.setdefault("last_update", None)
 st.session_state.setdefault("generated", {})
@@ -57,6 +58,25 @@ if st.session_state.products:
 
     name_to_id = {name: set_id for set_id, name in set_name_by_id.items()}
 
+    selected_lookup = set(st.session_state.get("selected_skus", []))
+    table_rows = []
+
+    def _extract_qty(prod: Dict[str, Any]) -> Optional[float]:
+        ext = prod.get("extension_attributes") or {}
+        stock_item = None
+        if isinstance(ext, dict):
+            stock_item = ext.get("stock_item")
+        if isinstance(stock_item, dict):
+            qty_value = stock_item.get("qty")
+        else:
+            qty_value = None
+        if qty_value in (None, ""):
+            return None
+        try:
+            return float(qty_value)
+        except (TypeError, ValueError):
+            return None
+
     for product in st.session_state.products:
         raw_set_id = product.get("attribute_set_id")
         try:
@@ -65,55 +85,72 @@ if st.session_state.products:
             set_id = None
         product["attribute_set_id"] = set_id
         if set_id is None:
-            product["attribute_set_name"] = "Unknown"
+            set_name = "Unknown"
         elif set_name_by_id:
-            product["attribute_set_name"] = set_name_by_id.get(set_id, str(set_id))
+            set_name = set_name_by_id.get(set_id, str(set_id))
         else:
-            product["attribute_set_name"] = str(set_id)
+            set_name = str(set_id)
+        product["attribute_set_name"] = set_name
 
-    df = pd.DataFrame([
-        {
-            "sku": p["sku"],
-            "name": p["name"],
-            "attribute_set_id": p.get("attribute_set_id"),
-            "attribute_set_name": p.get("attribute_set_name", "Unknown"),
-            "created_at": p["created_at"],
-        }
-        for p in st.session_state.products
-    ])
-
-    if set_name_by_id:
-        editable_df = st.data_editor(
-            df,
-            column_config={
-                "attribute_set_name": st.column_config.SelectboxColumn(
-                    options=sorted(set_name_by_id.values())
-                )
-            },
-            hide_index=True,
-            key="editable_products",
+        table_rows.append(
+            {
+                "select": product.get("sku") in selected_lookup,
+                "sku": product.get("sku"),
+                "name": product.get("name"),
+                "attribute_set": set_name,
+                "qty": _extract_qty(product),
+                "created_at": product.get("created_at"),
+            }
         )
 
-        if isinstance(editable_df, pd.DataFrame):
-            current_df = editable_df
-        elif editable_df is not None:
-            current_df = pd.DataFrame(editable_df)
-        else:
-            current_df = df
+    df = pd.DataFrame(table_rows)
+
+    column_config: Dict[str, Any] = {
+        "select": st.column_config.CheckboxColumn(
+            "Select", help="Mark products to work with in the attribute editor."
+        )
+    }
+    disabled_columns = ["sku", "name", "qty", "created_at"]
+
+    if set_name_by_id:
+        column_config["attribute_set"] = st.column_config.SelectboxColumn(
+            "Attribute Set", options=sorted(set_name_by_id.values())
+        )
     else:
-        st.dataframe(df)
+        disabled_columns.append("attribute_set")
+
+    editable_df = st.data_editor(
+        df,
+        column_config=column_config,
+        disabled=disabled_columns,
+        hide_index=True,
+        key="default_products_editor",
+    )
+
+    if isinstance(editable_df, pd.DataFrame):
+        current_df = editable_df
+    elif editable_df is not None:
+        current_df = pd.DataFrame(editable_df)
+    else:
         current_df = df
+
+    st.session_state["selected_skus"] = [
+        to_simple(sku)
+        for sku in current_df.loc[current_df["select"], "sku"].dropna().tolist()
+    ]
 
     edited_records = current_df.to_dict("records")
 
     name_by_sku = {
-        row.get("sku"): row.get("attribute_set_name", "Unknown")
+        row.get("sku"): row.get("attribute_set", "Unknown")
         for row in edited_records
         if row.get("sku")
     }
 
     for product in st.session_state.products:
-        selected_name = name_by_sku.get(product["sku"], product.get("attribute_set_name", "Unknown"))
+        selected_name = name_by_sku.get(
+            product["sku"], product.get("attribute_set_name", "Unknown")
+        )
         product["attribute_set_name"] = selected_name
         if set_name_by_id:
             new_set_id = name_to_id.get(selected_name)
@@ -125,7 +162,14 @@ if st.session_state.products:
             except (TypeError, ValueError):
                 pass
 
-    selected_skus = st.multiselect("Select SKUs", current_df["sku"])
+    if (
+        st.session_state.get("selected_product_id")
+        and st.session_state["selected_product_id"]
+        not in st.session_state["selected_skus"]
+    ):
+        st.session_state["selected_product_id"] = None
+
+    selected_skus = st.session_state["selected_skus"]
     hint = st.text_input("Optional hint (e.g. 'telecaster electric guitar')")  # пока не используем
 
     all_attr_codes_cache: Set[str] = set()
@@ -203,11 +247,12 @@ if st.session_state.products:
     # --- Unified Attribute Editor ---
     st.subheader("🛠️ Edit Attributes")
 
-    product_options = list(current_df["sku"].dropna())
-    editable_skus = selected_skus or product_options
+    editable_skus = selected_skus
 
     if not editable_skus:
-        st.info("Load products to enable the attribute editor.")
+        st.info("Select at least one product to enable the attribute editor.")
+        st.session_state["editor_open"] = False
+        st.session_state["selected_product_id"] = None
     else:
         if st.session_state.selected_product_id not in editable_skus:
             st.session_state["selected_product_id"] = to_simple(editable_skus[0])
@@ -230,7 +275,7 @@ if st.session_state.products:
             st.session_state["selected_product_id"] = selected_product_id
 
         open_editor = st.button(
-            "Open attribute editor", disabled=not bool(selected_product_id)
+            "Open attribute editor", disabled=not bool(st.session_state["selected_skus"])
         )
         if open_editor and selected_product_id is not None:
             st.session_state["editor_open"] = True
