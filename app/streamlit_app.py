@@ -3,7 +3,7 @@
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 import httpx
 import pandas as pd
@@ -20,7 +20,7 @@ from services.apply import (
     resolve_attribute_metadata,
 )
 from services.llm_extract import extract_attributes
-from services.normalize import normalize_value
+from services.normalize import normalize_value, resolve_option_ids
 
 st.set_page_config(page_title="Magento Product Enricher", layout="wide")
 
@@ -390,13 +390,19 @@ if st.session_state.products:
                         if code == "category_ids":
                             return ",".join(str(cid) for cid in current_categories)
                         if input_type == "multiselect":
-                            if isinstance(raw, list):
-                                return [str(v) for v in raw]
-                            if isinstance(raw, str):
-                                return [part.strip() for part in raw.split(",") if part.strip()]
-                            return []
+                            try:
+                                option_ids = resolve_option_ids(code, raw, attr_meta)
+                            except ValueError:
+                                option_ids = []
+                            return [str(option_id) for option_id in option_ids]
                         if input_type == "select":
-                            return str(raw) if raw not in (None, "") else None
+                            try:
+                                option_ids = resolve_option_ids(code, raw, attr_meta)
+                            except ValueError:
+                                option_ids = []
+                            if option_ids:
+                                return str(option_ids[0])
+                            return None
                         if input_type in {"boolean", "bool"}:
                             lowered = str(raw).strip().lower()
                             if lowered in {"1", "true", "yes", "on"}:
@@ -404,16 +410,47 @@ if st.session_state.products:
                             if lowered in {"0", "false", "no", "off"}:
                                 return 0
                             return None
-                        return str(raw or "")
+                        if raw is None:
+                            return None
+                        if isinstance(raw, (str, int, float, bool)):
+                            return raw
+                        if isinstance(raw, (list, tuple, set)):
+                            joined_parts: List[str] = []
+                            for item in raw:
+                                if item in (None, ""):
+                                    continue
+                                try:
+                                    joined_parts.append(str(to_simple(item)))
+                                except Exception:
+                                    joined_parts.append(str(item))
+                            return ",".join(joined_parts)
+                        try:
+                            return to_simple(raw)
+                        except Exception:
+                            return str(raw)
 
                     edit_codes = sorted(resolved_meta.keys())
 
-                    if st.session_state.get("active_form_sku") != sku:
+                    def _initialise_form_state(*, force_reset: bool = False) -> None:
+                        if force_reset:
+                            keys_to_clear = [
+                                key
+                                for key in list(st.session_state.keys())
+                                if key.startswith("attr_")
+                            ]
+                            for key in keys_to_clear:
+                                st.session_state.pop(key, None)
+                        st.session_state["active_form_sku"] = sku
                         for code in edit_codes:
-                            st.session_state[f"attr_{code}"] = _widget_default(
+                            state_key = f"attr_{code}"
+                            default_value = _widget_default(
                                 code, resolved_meta.get(code, {})
                             )
-                        st.session_state["active_form_sku"] = sku
+                            st.session_state.setdefault(state_key, default_value)
+
+                    _initialise_form_state(
+                        force_reset=st.session_state.get("active_form_sku") != sku
+                    )
 
                     with st.form(key="attr_editor", clear_on_submit=False):
                         for code in edit_codes:
@@ -444,10 +481,21 @@ if st.session_state.products:
                                     for opt in options
                                     if isinstance(opt, dict)
                                 }
+                                selected_values = st.session_state.get(state_key)
+                                if isinstance(selected_values, str):
+                                    selected_default = [
+                                        part
+                                        for part in (v.strip() for v in selected_values.split(","))
+                                        if part
+                                    ]
+                                elif isinstance(selected_values, int):
+                                    selected_default = [str(selected_values)]
+                                else:
+                                    selected_default = selected_values or []
                                 st.multiselect(
                                     label,
                                     option_values,
-                                    default=st.session_state.get(state_key, []),
+                                    default=selected_default,
                                     key=state_key,
                                     format_func=lambda v, lm=label_map: lm.get(str(v), str(v)),
                                 )
@@ -465,9 +513,10 @@ if st.session_state.products:
                                     if isinstance(opt, dict)
                                 }
                                 default_value = st.session_state.get(state_key)
+                                if isinstance(default_value, int):
+                                    default_value = str(default_value)
                                 if default_value not in option_values and option_values:
                                     default_value = option_values[0]
-                                    st.session_state[state_key] = default_value
                                 st.selectbox(
                                     label,
                                     option_values,
@@ -652,10 +701,7 @@ if st.session_state.products:
                             )
                         render_view_table(display_values)
 
-                        for code in edit_codes:
-                            st.session_state[f"attr_{code}"] = _widget_default(
-                                code, resolved_meta.get(code, {})
-                            )
+                        _initialise_form_state(force_reset=True)
 
         if st.session_state.last_update:
             with st.expander("Last update payload", expanded=False):

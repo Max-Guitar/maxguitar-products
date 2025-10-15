@@ -102,81 +102,145 @@ def _ensure_sequence(raw: Any) -> List[Any]:
     return [raw]
 
 
-def _options_from_meta(meta: Dict[str, Any]) -> List[Dict[str, str]]:
+def _options_from_meta(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     options: Sequence[Any] = meta.get("options") or []
-    normalized: List[Dict[str, str]] = []
+    normalized: List[Dict[str, Any]] = []
     for option in options:
         if not isinstance(option, dict):
             continue
-        raw_value = option.get("value")
-        if raw_value in (None, ""):
+        option_id = option.get("value")
+        if option_id in (None, ""):
+            continue
+        id_str = str(option_id).strip()
+        if not id_str:
             continue
         label = option.get("label") or option.get("label_default") or option.get("labelDefault")
+        label_str = str(label) if label is not None else id_str
+        candidates: List[str] = []
+        for candidate in (
+            id_str,
+            option.get("raw_value"),
+            option.get("value"),
+            option.get("label"),
+            option.get("label_default"),
+            option.get("labelDefault"),
+        ):
+            if candidate in (None, ""):
+                continue
+            candidate_str = str(candidate)
+            if candidate_str not in candidates:
+                candidates.append(candidate_str)
         normalized.append(
             {
-                "value": str(raw_value),
-                "label": str(label) if label is not None else str(raw_value),
+                "id": id_str,
+                "label": label_str,
+                "candidates": candidates,
             }
         )
     return normalized
 
 
-def _map_to_option_id(raw: Any, meta: Dict[str, Any]) -> Optional[str]:
+def _normalise_option_token(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    text = html.unescape(str(value)).strip()
+    if not text:
+        return None
+    return text.lower()
+
+
+def resolve_option_ids(code: str, raw_value: Any, meta: Dict[str, Any]) -> List[int]:
     options = _options_from_meta(meta)
-    if not options:
-        if raw is None:
-            return None
-        return str(raw)
+    id_map: Dict[str, int] = {}
+    norm_map: Dict[str, int] = {}
 
-    by_value = {opt["value"]: opt["value"] for opt in options}
-    by_label = {opt["label"].lower(): opt["value"] for opt in options}
-
-    if raw is None:
-        return None
-    candidate = raw
-    if isinstance(candidate, dict):
-        candidate = candidate.get("value") or candidate.get("option_id") or candidate.get(
-            "optionId"
-        )
-
-    if candidate is None:
-        return None
-
-    candidate_str = str(candidate).strip()
-    if not candidate_str:
-        return None
-
-    if candidate_str in by_value:
-        return by_value[candidate_str]
-
-    lowered = candidate_str.lower()
-    if lowered in by_label:
-        return by_label[lowered]
-
-    raise ValueError(f"Value '{candidate}' is not a valid option")
-
-
-def _normalise_multiselect(raw: Any, meta: Dict[str, Any]) -> Optional[str]:
-    values = []
-    for part in _ensure_sequence(raw):
-        option_id = _map_to_option_id(part, meta)
-        if option_id is None:
+    for option in options:
+        raw_id = option.get("id")
+        if raw_id in (None, ""):
             continue
-        if option_id not in values:
-            values.append(option_id)
-    if not values:
-        return None
-    return ",".join(values)
+        id_str = str(raw_id).strip()
+        if not id_str:
+            continue
+        try:
+            option_id = int(id_str)
+        except ValueError as exc:
+            raise ValueError(
+                f"Option id '{raw_id}' for attribute '{code}' is not numeric"
+            ) from exc
+        id_map.setdefault(id_str, option_id)
+        norm_key = _normalise_option_token(id_str)
+        if norm_key:
+            norm_map.setdefault(norm_key, option_id)
+        for candidate in option.get("candidates", []):
+            norm_candidate = _normalise_option_token(candidate)
+            if norm_candidate:
+                norm_map.setdefault(norm_candidate, option_id)
+
+    def _match_token(token: Any, *, allow_fallback: bool) -> Optional[int]:
+        if token in (None, ""):
+            return None
+        if isinstance(token, dict):
+            for key in ("option_id", "optionId", "value", "label"):
+                if key in token:
+                    resolved = _match_token(
+                        token.get(key), allow_fallback=allow_fallback
+                    )
+                    if resolved is not None:
+                        return resolved
+            return None
+        if isinstance(token, (list, tuple, set)):
+            for item in token:
+                resolved = _match_token(item, allow_fallback=allow_fallback)
+                if resolved is not None:
+                    return resolved
+            return None
+        token_str = str(token).strip()
+        if not token_str:
+            return None
+        if options:
+            if token_str in id_map:
+                return id_map[token_str]
+            norm_token = _normalise_option_token(token_str)
+            if norm_token and norm_token in norm_map:
+                return norm_map[norm_token]
+            return None
+        if not allow_fallback:
+            return None
+        try:
+            return int(token_str)
+        except ValueError as exc:
+            raise ValueError(f"Value '{token}' is not a valid option for '{code}'") from exc
+
+    resolved: List[int] = []
+    if raw_value is None:
+        return resolved
+
+    candidates = _ensure_sequence(raw_value)
+    for candidate in candidates:
+        option_id = _match_token(candidate, allow_fallback=not bool(options))
+        if option_id is None:
+            raise ValueError(f"Value '{candidate}' is not a valid option for '{code}'")
+        if option_id not in resolved:
+            resolved.append(option_id)
+    return resolved
 
 
-def _normalise_select(raw: Any, meta: Dict[str, Any]) -> Optional[int]:
-    option_id = _map_to_option_id(raw, meta)
-    if option_id is None:
+def _normalise_multiselect(code: str, raw: Any, meta: Dict[str, Any]) -> Optional[str]:
+    option_ids = resolve_option_ids(code, raw, meta)
+    if not option_ids:
         return None
-    try:
-        return int(option_id)
-    except ValueError as exc:  # pragma: no cover - defensive for unexpected data
-        raise ValueError(f"Option id '{option_id}' for select '{meta.get('attribute_code')}' is not an int") from exc
+    return ",".join(str(option_id) for option_id in option_ids)
+
+
+def _normalise_select(code: str, raw: Any, meta: Dict[str, Any]) -> Optional[int]:
+    option_ids = resolve_option_ids(code, raw, meta)
+    if not option_ids:
+        return None
+    if len(option_ids) > 1:
+        raise ValueError(
+            f"Multiple option ids resolved for single-select attribute '{code}'"
+        )
+    return option_ids[0]
 
 
 def _determine_input_type(code: str, meta: Dict[str, Any]) -> str:
@@ -226,10 +290,10 @@ def normalize_value(attr_code: str, raw_value: Any, meta: Optional[Dict[str, Any
             raise ValueError("Category ids must be integers") from exc
 
     if input_type == "multiselect":
-        return _normalise_multiselect(raw_value, meta)
+        return _normalise_multiselect(attr_code, raw_value, meta)
 
     if input_type == "select":
-        return _normalise_select(raw_value, meta)
+        return _normalise_select(attr_code, raw_value, meta)
 
     if input_type in {"boolean", "bool"}:
         return _normalise_bool(raw_value)

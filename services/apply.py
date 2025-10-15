@@ -39,8 +39,11 @@ def _normalise_options(options: Any) -> list[dict[str, str]]:
     for option in options:
         if not isinstance(option, dict):
             continue
+        option_id = option.get("option_id")
         raw_value = option.get("value")
-        if raw_value in (None, ""):
+        if option_id in (None, ""):
+            option_id = raw_value
+        if option_id in (None, ""):
             continue
         label = (
             option.get("label")
@@ -48,12 +51,16 @@ def _normalise_options(options: Any) -> list[dict[str, str]]:
             or option.get("labelDefault")
             or option.get("default_label")
         )
-        normalised.append(
-            {
-                "value": str(raw_value),
-                "label": str(label) if label is not None else str(raw_value),
-            }
-        )
+        value_str = str(option_id)
+        entry: dict[str, str] = {
+            "value": value_str,
+            "label": str(label) if label is not None else value_str,
+        }
+        if raw_value not in (None, ""):
+            raw_str = str(raw_value)
+            if raw_str != value_str:
+                entry["raw_value"] = raw_str
+        normalised.append(entry)
     return normalised
 
 
