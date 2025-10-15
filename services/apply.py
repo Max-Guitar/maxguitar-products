@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from connectors.magento import client
 
+from services.normalize import ATTR_TYPE_OVERRIDES
+
 
 def _looks_like_float(candidate: str) -> bool:
     try:
@@ -158,6 +160,7 @@ def normalise_attribute_value(
 
     attr_meta = attr_meta or {}
     input_type = str(attr_meta.get("input") or "").lower()
+    override_type = ATTR_TYPE_OVERRIDES.get(code)
 
     if code == "custom_layout_update_file":
         if value is None:
@@ -193,11 +196,36 @@ def normalise_attribute_value(
     if input_type == "multiselect":
         return _normalise_int_list(value)
     if input_type == "select":
+        if override_type == "str":
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple, set)):
+                first = next((v for v in value if v not in (None, "")), None)
+                return str(first).strip() if first is not None else None
+            if isinstance(value, str):
+                trimmed = value.strip()
+                return trimmed or None
+            return str(value)
         return _normalise_single_int(value)
     if input_type in {"boolean", "bool"}:
         return _normalise_bool_flag(value)
 
     return _generic_normalise(value)
+
+
+SYSTEM_ATTRIBUTE_CODES = {
+    "category_ids",
+    "quantity_and_stock_status",
+    "type_id",
+    "attribute_set_id",
+    "price",
+    "status",
+    "visibility",
+    "weight",
+    "name",
+    "extension_attributes",
+    "custom_attributes",
+}
 
 
 def build_product_payload(
@@ -208,15 +236,22 @@ def build_product_payload(
     """Return a Magento product payload respecting attribute types."""
 
     metadata = metadata or {}
-    product: Dict[str, Any] = {"sku": sku}
-    extension_attributes: Dict[str, Any] = {}
-    custom_attributes: List[Dict[str, Any]] = []
+    product: Dict[str, Any] = {
+        "sku": sku,
+        "custom_attributes": [],
+        "extension_attributes": {},
+    }
+    extension_attributes: Dict[str, Any] = product["extension_attributes"]
+    custom_attributes: List[Dict[str, Any]] = product["custom_attributes"]
 
     for code, raw_value in attributes.items():
         attr_meta = metadata.get(code, {})
         normalised = normalise_attribute_value(code, raw_value, attr_meta)
         if normalised is None:
             continue
+        if code in SYSTEM_ATTRIBUTE_CODES:
+            continue
+        override_type = ATTR_TYPE_OVERRIDES.get(code)
         if code == "category_ids":
             if not isinstance(normalised, list):
                 raise ValueError("Attribute 'category_ids' must be a list of integers")
@@ -236,7 +271,12 @@ def build_product_payload(
                     f"Attribute '{code}' must be a list of integers for multiselect"
                 )
         elif attr_meta.get("input", "").lower() == "select":
-            if not isinstance(normalised, int):
+            if override_type == "str":
+                if not isinstance(normalised, str):
+                    raise ValueError(
+                        f"Attribute '{code}' must be normalised to a string override"
+                    )
+            elif not isinstance(normalised, int):
                 raise ValueError(f"Attribute '{code}' must be an integer for select")
         elif attr_meta.get("input", "").lower() in {"boolean", "bool"}:
             if normalised not in {0, 1}:
@@ -244,12 +284,6 @@ def build_product_payload(
                     f"Attribute '{code}' must be normalised to 0 or 1 for boolean fields"
                 )
         custom_attributes.append({"attribute_code": code, "value": normalised})
-
-    if extension_attributes:
-        product["extension_attributes"] = extension_attributes
-
-    if custom_attributes:
-        product["custom_attributes"] = custom_attributes
 
     return {"product": product}
 

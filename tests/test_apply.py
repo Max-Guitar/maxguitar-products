@@ -45,7 +45,13 @@ def test_custom_layout_update_file_sentinels_are_dropped(value: str):
         {"custom_layout_update_file": value},
     )
 
-    assert payload == {"product": {"sku": "SKU123"}}
+    assert payload == {
+        "product": {
+            "sku": "SKU123",
+            "custom_attributes": [],
+            "extension_attributes": {},
+        }
+    }
 
 
 def test_custom_layout_update_file_passes_through_real_path():
@@ -63,6 +69,7 @@ def test_custom_layout_update_file_passes_through_real_path():
                     "value": "Magento/theme/layout.xml",
                 }
             ],
+            "extension_attributes": {},
         }
     }
 
@@ -93,4 +100,10 @@ def test_apply_product_update_regenerates_payload(monkeypatch: pytest.MonkeyPatc
 
     assert response == {"status": "ok"}
     assert captured["endpoint"] == "products/SKU123"
-    assert captured["payload"] == {"product": {"sku": "SKU123"}}
+    assert captured["payload"] == {
+        "product": {
+            "sku": "SKU123",
+            "custom_attributes": [],
+            "extension_attributes": {},
+        }
+    }

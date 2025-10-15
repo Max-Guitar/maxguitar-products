@@ -3,7 +3,7 @@
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 
 import httpx
 import pandas as pd
@@ -517,30 +517,30 @@ if st.session_state.products:
                                                 meta,
                                                 payload=payload,
                                             )
-                                            st.toast("✅ Attributes saved successfully")
+                                            st.toast("Saved")
                                         except httpx.HTTPStatusError as exc:
-                                            status_code = getattr(
-                                                exc.response, "status_code", None
+                                            status_code = getattr(exc.response, "status_code", None)
+                                            request_url = str(
+                                                getattr(exc.request, "url", "Unknown URL")
                                             )
-                                            request_url = getattr(
-                                                exc.request, "url", "Unknown URL"
-                                            )
-                                            request_body = getattr(
+                                            request_body: Optional[str]
+                                            body_candidate = getattr(
                                                 exc.request, "content", b""
                                             )
-                                            if isinstance(request_body, bytes):
-                                                request_body = request_body.decode(
+                                            if isinstance(body_candidate, bytes):
+                                                request_body = body_candidate.decode(
                                                     "utf-8", errors="replace"
                                                 )
+                                            else:
+                                                request_body = str(body_candidate)
                                             response_text = getattr(
                                                 exc.response, "text", ""
                                             )
-                                            status_display = status_code or "?"
                                             st.error(
                                                 "\n".join(
                                                     [
                                                         "❌ Failed to save attributes:",
-                                                        f"Status: {status_display}",
+                                                        f"Status: {status_code or '?'}",
                                                         f"URL: {request_url}",
                                                         "Request body:",
                                                         request_body
@@ -558,9 +558,9 @@ if st.session_state.products:
                                                 "request": payload,
                                                 "response": {
                                                     "status_code": status_code,
-                                                    "body": getattr(
-                                                        exc.response, "text", None
-                                                    ),
+                                                    "url": request_url,
+                                                    "request_body": request_body,
+                                                    "body": response_text,
                                                 },
                                             }
                                             render_update_report()
@@ -614,11 +614,25 @@ if st.session_state.products:
                                             ]
                                             st.session_state.product_details[sku] = prod_full
 
+                                            payload_extension = (
+                                                product_payload.get(
+                                                    "extension_attributes", {}
+                                                )
+                                            )
+                                            if payload_extension:
+                                                prod_full.setdefault(
+                                                    "extension_attributes", {}
+                                                ).update(payload_extension)
+
                                             for prod in st.session_state.products:
                                                 if prod.get("sku") == sku:
                                                     prod["custom_attributes"] = prod_full.get(
                                                         "custom_attributes", []
                                                     )
+                                                    if payload_extension:
+                                                        prod.setdefault(
+                                                            "extension_attributes", {}
+                                                        ).update(payload_extension)
                                                     break
 
                                             render_view_table(curr)
