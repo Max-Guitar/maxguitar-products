@@ -35,13 +35,98 @@ class MagentoClient:
         return r.json()
 
     def get_default_products(self):
-        """Return products that belong to the default attribute set (id = 4)."""
-        search = {
-            "searchCriteria[filter_groups][0][filters][0][field]": "attribute_set_id",
-            "searchCriteria[filter_groups][0][filters][0][value]": "4",  # Default set id
-            "searchCriteria[filter_groups][0][filters][0][condition_type]": "eq",
+        """Return in-stock products that belong to the default attribute set."""
+
+        set_id = self.get_default_attribute_set_id()
+        query = """
+        query ($pageSize: Int!, $currentPage: Int!, $setId: String!) {
+          products(
+            pageSize: $pageSize,
+            currentPage: $currentPage,
+            filter: {
+              attribute_set_id: { eq: $setId }
+              stock_status: { eq: IN_STOCK }
+            }
+          ) {
+            items {
+              sku
+              name
+              created_at
+              attribute_set_id
+              stock_status
+            }
+            total_count
+            page_info {
+              total_pages
+              current_page
+            }
+          }
         }
-        return self.get("products", params=search)
+        """
+
+        page_size = 100
+        current_page = 1
+        items: List[Dict[str, Any]] = []
+        total_count: Optional[int] = None
+
+        while True:
+            variables = {
+                "pageSize": page_size,
+                "currentPage": current_page,
+                "setId": str(set_id),
+            }
+            data = self.graphql(query, variables=variables)
+            products = (data.get("data") or {}).get("products") or {}
+            page_items = products.get("items") or []
+            items.extend(page_items)
+            if total_count is None:
+                total_count = products.get("total_count")
+            page_info = products.get("page_info") or {}
+            total_pages = page_info.get("total_pages") or 0
+            if total_pages and current_page >= total_pages:
+                break
+            if not page_items:
+                break
+            if len(page_items) < page_size and not total_pages:
+                break
+            current_page += 1
+
+        return {"items": items, "total_count": total_count or len(items)}
+
+    def graphql(
+        self, query: str, variables: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Execute a GraphQL query against Magento."""
+
+        url = f"{self.base_url}/graphql"
+        payload: Dict[str, Any] = {"query": query}
+        if variables:
+            payload["variables"] = variables
+        r = httpx.post(url, headers=self.headers, json=payload, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        errors = data.get("errors")
+        if errors:
+            raise RuntimeError(f"Magento GraphQL error: {errors}")
+        return data
+
+    @lru_cache(maxsize=1)
+    def get_default_attribute_set_id(self) -> int:
+        """Return the attribute set id for the Magento default set."""
+
+        try:
+            sets = self.get_attribute_sets()
+        except Exception:
+            return 4
+
+        for set_id, name in sets.items():
+            if isinstance(name, str) and name.lower() == "default":
+                return set_id
+
+        try:
+            return next(iter(sets.keys()))
+        except StopIteration:
+            return 4
 
     def get_product(self, sku: Union[int, str]) -> Dict[str, Any]:
         """Return a single product by SKU, ensuring the SKU is safe for URL usage."""

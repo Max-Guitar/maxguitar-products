@@ -37,6 +37,8 @@ st.session_state.setdefault("last_update", None)
 st.session_state.setdefault("generated", {})
 st.session_state.setdefault("original_attrs", {})
 st.session_state.setdefault("active_form_sku", None)
+st.session_state.setdefault("products_loaded", False)
+st.session_state.setdefault("load_message", "")
 
 
 def to_simple(value):
@@ -46,12 +48,19 @@ def to_simple(value):
         return value.item()
     return int(value)
 
-if st.button("🔄 Load Default Products"):
-    data = client.get_default_products()
-    st.session_state.products = data.get("items", [])
-    st.success(f"Loaded {len(st.session_state.products)} products")
-    st.session_state["default_df"] = None
-    st.session_state["qty_cache"] = {}
+if not st.session_state.get("products_loaded"):
+    with st.spinner("Loading in-stock default products..."):
+        data = client.get_default_products()
+        st.session_state.products = data.get("items", [])
+        st.session_state["default_df"] = None
+        st.session_state["qty_cache"] = {}
+        st.session_state["products_loaded"] = True
+        st.session_state["load_message"] = (
+            f"Loaded {len(st.session_state.products)} in-stock default products"
+        )
+
+if st.session_state.get("load_message"):
+    st.info(st.session_state["load_message"])
 
 if st.session_state.products:
     set_name_by_id = {}
@@ -75,13 +84,17 @@ if st.session_state.products:
             qty_cache[sku_value] = client.get_product_quantity(sku_value)
         return qty_cache.get(sku_value)
 
-    for product in st.session_state.products:
+    filtered_products: List[Dict[str, Any]] = []
+    for product in list(st.session_state.products):
         raw_set_id = product.get("attribute_set_id")
         try:
             set_id = int(raw_set_id)
         except (TypeError, ValueError):
             set_id = None
         product["attribute_set_id"] = set_id
+        qty_value = _extract_qty(product)
+        if qty_value is None or qty_value <= 0:
+            continue
         if set_id is None:
             set_name = "Unknown"
         elif set_name_by_id:
@@ -89,6 +102,7 @@ if st.session_state.products:
         else:
             set_name = str(set_id)
         product["attribute_set_name"] = set_name
+        filtered_products.append(product)
 
         table_rows.append(
             {
@@ -96,12 +110,17 @@ if st.session_state.products:
                 "sku": product.get("sku"),
                 "name": product.get("name"),
                 "attribute_set": set_name,
-                "qty": _extract_qty(product),
+                "qty": qty_value,
                 "created_at": product.get("created_at"),
             }
         )
 
-    base_df = pd.DataFrame(table_rows).set_index("sku", drop=False)
+    st.session_state.products = filtered_products
+
+    columns = ["select", "sku", "name", "attribute_set", "qty", "created_at"]
+    base_df = pd.DataFrame(table_rows, columns=columns)
+    if "sku" in base_df.columns:
+        base_df = base_df.set_index("sku", drop=False)
     default_df = st.session_state.get("default_df")
 
     if default_df is None or not isinstance(default_df, pd.DataFrame):
