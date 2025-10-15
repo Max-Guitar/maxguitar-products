@@ -1,7 +1,7 @@
 """HTTP client helpers for interacting with Magento's REST API."""
 
 from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Union
+from typing import Any, Dict, Iterable, List, Optional, Union
 from urllib.parse import quote
 
 import httpx
@@ -48,6 +48,79 @@ class MagentoClient:
 
         encoded_sku = quote(str(sku), safe="")
         return self.get(f"products/{encoded_sku}")
+
+    def get_product_quantity(self, sku: Union[int, str]) -> Optional[float]:
+        """Return available quantity for a SKU, supporting both MSI and legacy stock APIs."""
+
+        encoded_sku = quote(str(sku), safe="")
+        msi_endpoints = [
+            f"inventory/get-source-items/{encoded_sku}",
+            f"inventory/get-product-sources/{encoded_sku}",
+        ]
+
+        for endpoint in msi_endpoints:
+            try:
+                data = self.get(endpoint)
+            except httpx.HTTPStatusError as exc:
+                if exc.response is not None and exc.response.status_code in (400, 404):
+                    continue
+                raise
+            except Exception:
+                continue
+
+            if isinstance(data, dict):
+                for key in (
+                    "items",
+                    "source_items",
+                    "sources",
+                    "sourceItems",
+                    "sourceItemList",
+                ):
+                    if key in data:
+                        candidate = data.get(key) or []
+                        break
+                else:
+                    candidate = [data] if data else []
+            else:
+                candidate = data or []
+
+            total = 0.0
+            found_value = False
+            for item in candidate:
+                quantity = (
+                    item.get("salable_quantity")
+                    or item.get("quantity")
+                    or item.get("available_quantity")
+                )
+                if quantity in (None, ""):
+                    continue
+                try:
+                    total += float(quantity)
+                    found_value = True
+                except (TypeError, ValueError):
+                    continue
+            if found_value:
+                return total
+
+        try:
+            data = self.get(f"stockItems/{encoded_sku}")
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code in (400, 404):
+                return None
+            raise
+        except Exception:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        quantity = data.get("qty") or data.get("quantity")
+        if quantity in (None, ""):
+            return None
+        try:
+            return float(quantity)
+        except (TypeError, ValueError):
+            return None
 
     @lru_cache(maxsize=1)
     def get_attribute_sets(self):

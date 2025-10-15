@@ -30,6 +30,8 @@ st.session_state.setdefault("products", [])
 st.session_state.setdefault("product_details", {})
 st.session_state.setdefault("selected_product_id", None)
 st.session_state.setdefault("selected_skus", [])
+st.session_state.setdefault("default_df", None)
+st.session_state.setdefault("qty_cache", {})
 st.session_state.setdefault("editor_open", False)
 st.session_state.setdefault("last_update", None)
 st.session_state.setdefault("generated", {})
@@ -48,6 +50,8 @@ if st.button("🔄 Load Default Products"):
     data = client.get_default_products()
     st.session_state.products = data.get("items", [])
     st.success(f"Loaded {len(st.session_state.products)} products")
+    st.session_state["default_df"] = None
+    st.session_state["qty_cache"] = {}
 
 if st.session_state.products:
     set_name_by_id = {}
@@ -61,21 +65,15 @@ if st.session_state.products:
     selected_lookup = set(st.session_state.get("selected_skus", []))
     table_rows = []
 
+    qty_cache: Dict[str, Optional[float]] = st.session_state.setdefault("qty_cache", {})
+
     def _extract_qty(prod: Dict[str, Any]) -> Optional[float]:
-        ext = prod.get("extension_attributes") or {}
-        stock_item = None
-        if isinstance(ext, dict):
-            stock_item = ext.get("stock_item")
-        if isinstance(stock_item, dict):
-            qty_value = stock_item.get("qty")
-        else:
-            qty_value = None
-        if qty_value in (None, ""):
+        sku_value = prod.get("sku")
+        if not sku_value:
             return None
-        try:
-            return float(qty_value)
-        except (TypeError, ValueError):
-            return None
+        if sku_value not in qty_cache:
+            qty_cache[sku_value] = client.get_product_quantity(sku_value)
+        return qty_cache.get(sku_value)
 
     for product in st.session_state.products:
         raw_set_id = product.get("attribute_set_id")
@@ -103,7 +101,27 @@ if st.session_state.products:
             }
         )
 
-    df = pd.DataFrame(table_rows)
+    base_df = pd.DataFrame(table_rows).set_index("sku", drop=False)
+    default_df = st.session_state.get("default_df")
+
+    if default_df is None or not isinstance(default_df, pd.DataFrame):
+        default_df = base_df.copy()
+    else:
+        default_df = default_df.copy()
+        # Align to latest product ordering/values without losing selection column edits
+        default_df = default_df.reindex(base_df.index, copy=False)
+        if "select" not in default_df.columns:
+            default_df["select"] = False
+        if "select" in base_df.columns:
+            default_df["select"] = default_df["select"].where(
+                default_df["select"].notna(), base_df["select"]
+            )
+        for column in base_df.columns:
+            if column == "select":
+                continue
+            default_df[column] = base_df[column]
+
+    st.session_state["default_df"] = default_df
 
     column_config: Dict[str, Any] = {
         "select": st.column_config.CheckboxColumn(
@@ -120,26 +138,40 @@ if st.session_state.products:
         disabled_columns.append("attribute_set")
 
     editable_df = st.data_editor(
-        df,
+        default_df,
         column_config=column_config,
         disabled=disabled_columns,
         hide_index=True,
-        key="default_products_editor",
+        num_rows="fixed",
+        use_container_width=True,
+        key="default_table",
     )
 
     if isinstance(editable_df, pd.DataFrame):
-        current_df = editable_df
+        updated_df = editable_df
     elif editable_df is not None:
-        current_df = pd.DataFrame(editable_df)
+        updated_df = pd.DataFrame(editable_df)
     else:
-        current_df = df
+        updated_df = default_df
 
-    st.session_state["selected_skus"] = [
-        to_simple(sku)
-        for sku in current_df.loc[current_df["select"], "sku"].dropna().tolist()
-    ]
+    for column in updated_df.columns:
+        if column in default_df.columns:
+            default_df.loc[updated_df.index, column] = updated_df[column]
 
-    edited_records = current_df.to_dict("records")
+    if "select" in default_df.columns:
+        default_df["select"] = default_df["select"].fillna(False).astype(bool)
+
+    st.session_state["default_df"] = default_df
+
+    st.session_state["selected_skus"] = (
+        default_df.query("select == True")
+        .get("sku", pd.Series(dtype=object))
+        .dropna()
+        .map(to_simple)
+        .tolist()
+    )
+
+    edited_records = default_df.to_dict("records")
 
     name_by_sku = {
         row.get("sku"): row.get("attribute_set", "Unknown")
