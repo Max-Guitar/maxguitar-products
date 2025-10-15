@@ -3,7 +3,7 @@
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, Set
+from typing import Any, Dict, Optional, Set
 
 import httpx
 import pandas as pd
@@ -513,6 +513,14 @@ if st.session_state.products:
                         }
 
                         original_snapshot = st.session_state["original_attrs"].get(sku, {})
+                        diff: Dict[str, Any]
+                        resolved: Dict[str, Any]
+                        payload: Dict[str, Any]
+                        response: Dict[str, Any] = {}
+                        mismatches: Optional[Dict[str, Any]] = None
+                        product_state: Dict[str, Any] = {}
+                        can_proceed = True
+
                         try:
                             diff, resolved, payload = build_product_payload(
                                 sku,
@@ -523,63 +531,64 @@ if st.session_state.products:
                             )
                         except ValueError as exc:
                             st.error(f"Failed to build product payload: {exc}")
-                            continue
+                            can_proceed = False
 
-                        if not diff:
+                        if can_proceed and not diff:
                             st.toast("No changes")
-                            continue
+                            can_proceed = False
 
-                        st.code(json.dumps(diff, indent=2))
-                        st.code(json.dumps(payload.get("product", {}), indent=2))
+                        if can_proceed:
+                            st.code(json.dumps(diff, indent=2))
+                            st.code(json.dumps(payload.get("product", {}), indent=2))
 
-                        with st.spinner("Saving attributes to Magento…"):
-                            try:
-                                response, mismatches, product_state = apply_product_update(
-                                    sku, diff, resolved, payload
-                                )
-                            except httpx.HTTPStatusError as exc:
-                                status_code = getattr(exc.response, "status_code", None)
-                                request_url = getattr(exc.request, "url", "Unknown URL")
-                                request_body = getattr(exc.request, "content", b"")
-                                if isinstance(request_body, bytes):
-                                    request_body = request_body.decode(
-                                        "utf-8", errors="replace"
+                            with st.spinner("Saving attributes to Magento…"):
+                                try:
+                                    response, mismatches, product_state = apply_product_update(
+                                        sku, diff, resolved, payload
                                     )
-                                response_text = getattr(exc.response, "text", "")
-                                st.error(
-                                    "\n".join(
-                                        [
-                                            "❌ Failed to save attributes:",
-                                            f"Status: {status_code or '?'}",
-                                            f"URL: {request_url}",
-                                            "Request body:",
-                                            request_body or "<empty request body>",
-                                            "Response text:",
-                                            response_text or "<empty response>",
-                                        ]
+                                except httpx.HTTPStatusError as exc:
+                                    status_code = getattr(exc.response, "status_code", None)
+                                    request_url = getattr(exc.request, "url", "Unknown URL")
+                                    request_body = getattr(exc.request, "content", b"")
+                                    if isinstance(request_body, bytes):
+                                        request_body = request_body.decode(
+                                            "utf-8", errors="replace"
+                                        )
+                                    response_text = getattr(exc.response, "text", "")
+                                    st.error(
+                                        "\n".join(
+                                            [
+                                                "❌ Failed to save attributes:",
+                                                f"Status: {status_code or '?'}",
+                                                f"URL: {request_url}",
+                                                "Request body:",
+                                                request_body or "<empty request body>",
+                                                "Response text:",
+                                                response_text or "<empty response>",
+                                            ]
+                                        )
                                     )
-                                )
-                                st.session_state.last_update = {
-                                    "sku": sku,
-                                    "status": "error",
-                                    "request": payload,
-                                    "response": {
-                                        "status_code": status_code,
-                                        "body": response_text,
-                                    },
-                                }
-                                continue
-                            except Exception as exc:
-                                st.error(f"Unexpected error: {exc}")
-                                st.session_state.last_update = {
-                                    "sku": sku,
-                                    "status": "error",
-                                    "request": payload,
-                                    "response": {"error": str(exc)},
-                                }
-                                continue
+                                    st.session_state.last_update = {
+                                        "sku": sku,
+                                        "status": "error",
+                                        "request": payload,
+                                        "response": {
+                                            "status_code": status_code,
+                                            "body": response_text,
+                                        },
+                                    }
+                                    can_proceed = False
+                                except Exception as exc:
+                                    st.error(f"Unexpected error: {exc}")
+                                    st.session_state.last_update = {
+                                        "sku": sku,
+                                        "status": "error",
+                                        "request": payload,
+                                        "response": {"error": str(exc)},
+                                    }
+                                    can_proceed = False
 
-                        if mismatches:
+                        if can_proceed and mismatches:
                             st.error("Not applied")
                             st.json(mismatches)
                             st.session_state.last_update = {
@@ -588,17 +597,18 @@ if st.session_state.products:
                                 "request": payload,
                                 "response": {"mismatches": mismatches},
                             }
-                            continue
+                            can_proceed = False
 
-                        st.toast("Saved")
+                        if can_proceed:
+                            st.toast("Saved")
 
-                        st.session_state.last_update = {
-                            "sku": sku,
-                            "status": "success",
-                            "request": payload,
-                            "response": response,
-                            "diff": diff,
-                        }
+                            st.session_state.last_update = {
+                                "sku": sku,
+                                "status": "success",
+                                "request": payload,
+                                "response": response,
+                                "diff": diff,
+                            }
 
                         fresh_custom = {
                             attr.get("attribute_code"): attr.get("value")
