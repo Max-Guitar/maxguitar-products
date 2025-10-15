@@ -500,7 +500,13 @@ if st.session_state.products:
                             else:
                                 try:
                                     payload = build_product_payload(
-                                        sku, cleaned_values, meta
+                                        sku,
+                                        cleaned_values,
+                                        meta,
+                                        original_attributes=curr,
+                                        original_extension_attributes=prod_full.get(
+                                            "extension_attributes", {}
+                                        ),
                                     )
                                 except ValueError as exc:
                                     st.error(
@@ -518,6 +524,10 @@ if st.session_state.products:
                                                 cleaned_values,
                                                 meta,
                                                 payload=payload,
+                                                original_attributes=curr,
+                                                original_extension_attributes=prod_full.get(
+                                                    "extension_attributes", {}
+                                                ),
                                             )
                                             st.toast("Saved")
                                         except httpx.HTTPStatusError as exc:
