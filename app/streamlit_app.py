@@ -391,17 +391,37 @@ if st.session_state.products:
                             return ",".join(str(cid) for cid in current_categories)
                         if input_type == "multiselect":
                             try:
-                                option_ids = resolve_option_ids(code, raw, attr_meta)
+                                resolved = resolve_option_ids(
+                                    code,
+                                    raw,
+                                    lambda requested_code, meta=attr_meta: meta
+                                    if requested_code == code
+                                    else {},
+                                )
                             except ValueError:
-                                option_ids = []
-                            return [str(option_id) for option_id in option_ids]
+                                resolved = None
+                            if isinstance(resolved, str):
+                                return [
+                                    part
+                                    for part in (v.strip() for v in resolved.split(","))
+                                    if part
+                                ]
+                            if isinstance(resolved, int):
+                                return [str(resolved)]
+                            return []
                         if input_type == "select":
                             try:
-                                option_ids = resolve_option_ids(code, raw, attr_meta)
+                                resolved = resolve_option_ids(
+                                    code,
+                                    raw,
+                                    lambda requested_code, meta=attr_meta: meta
+                                    if requested_code == code
+                                    else {},
+                                )
                             except ValueError:
-                                option_ids = []
-                            if option_ids:
-                                return str(option_ids[0])
+                                resolved = None
+                            if isinstance(resolved, int):
+                                return str(resolved)
                             return None
                         if input_type in {"boolean", "bool"}:
                             lowered = str(raw).strip().lower()
@@ -562,13 +582,6 @@ if st.session_state.products:
                         }
 
                         original_snapshot = st.session_state["original_attrs"].get(sku, {})
-                        diff: Dict[str, Any]
-                        resolved: Dict[str, Any]
-                        payload: Dict[str, Any]
-                        response: Dict[str, Any] = {}
-                        mismatches: Optional[Dict[str, Any]] = None
-                        product_state: Dict[str, Any] = {}
-                        can_proceed = True
 
                         try:
                             diff, resolved, payload = build_product_payload(
@@ -580,64 +593,50 @@ if st.session_state.products:
                             )
                         except ValueError as exc:
                             st.error(f"Failed to build product payload: {exc}")
-                            can_proceed = False
+                            continue
 
-                        if can_proceed and not diff:
+                        if not diff:
                             st.toast("No changes")
-                            can_proceed = False
+                            continue
 
-                        if can_proceed:
-                            st.code(json.dumps(diff, indent=2))
-                            st.code(json.dumps(payload.get("product", {}), indent=2))
+                        st.code(json.dumps(diff, indent=2))
 
-                            with st.spinner("Saving attributes to Magento…"):
-                                try:
-                                    response, mismatches, product_state = apply_product_update(
-                                        sku, diff, resolved, payload
-                                    )
-                                except httpx.HTTPStatusError as exc:
-                                    status_code = getattr(exc.response, "status_code", None)
-                                    request_url = getattr(exc.request, "url", "Unknown URL")
-                                    request_body = getattr(exc.request, "content", b"")
-                                    if isinstance(request_body, bytes):
-                                        request_body = request_body.decode(
-                                            "utf-8", errors="replace"
-                                        )
-                                    response_text = getattr(exc.response, "text", "")
-                                    st.error(
-                                        "\n".join(
-                                            [
-                                                "❌ Failed to save attributes:",
-                                                f"Status: {status_code or '?'}",
-                                                f"URL: {request_url}",
-                                                "Request body:",
-                                                request_body or "<empty request body>",
-                                                "Response text:",
-                                                response_text or "<empty response>",
-                                            ]
-                                        )
-                                    )
-                                    st.session_state.last_update = {
-                                        "sku": sku,
-                                        "status": "error",
-                                        "request": payload,
-                                        "response": {
-                                            "status_code": status_code,
-                                            "body": response_text,
-                                        },
-                                    }
-                                    can_proceed = False
-                                except Exception as exc:
-                                    st.error(f"Unexpected error: {exc}")
-                                    st.session_state.last_update = {
-                                        "sku": sku,
-                                        "status": "error",
-                                        "request": payload,
-                                        "response": {"error": str(exc)},
-                                    }
-                                    can_proceed = False
+                        response: Dict[str, Any] = {}
+                        mismatches: Optional[Dict[str, Any]] = None
 
-                        if can_proceed and mismatches:
+                        with st.spinner("Saving attributes to Magento…"):
+                            try:
+                                response, mismatches, _ = apply_product_update(
+                                    sku, diff, resolved
+                                )
+                            except httpx.HTTPStatusError as exc:
+                                status_code = getattr(exc.response, "status_code", None)
+                                response_text = getattr(exc.response, "text", "")
+                                request_url = getattr(exc.request, "url", "Unknown URL")
+                                st.session_state.last_update = {
+                                    "sku": sku,
+                                    "status": "error",
+                                    "request": payload,
+                                    "response": {
+                                        "status_code": status_code,
+                                        "body": response_text,
+                                        "url": str(request_url),
+                                    },
+                                    "diff": diff,
+                                }
+                                continue
+                            except Exception as exc:
+                                st.error(f"Unexpected error: {exc}")
+                                st.session_state.last_update = {
+                                    "sku": sku,
+                                    "status": "error",
+                                    "request": payload,
+                                    "response": {"error": str(exc)},
+                                    "diff": diff,
+                                }
+                                continue
+
+                        if mismatches:
                             st.error("Not applied")
                             st.json(mismatches)
                             st.session_state.last_update = {
@@ -645,63 +644,75 @@ if st.session_state.products:
                                 "status": "error",
                                 "request": payload,
                                 "response": {"mismatches": mismatches},
-                            }
-                            can_proceed = False
-
-                        if can_proceed:
-                            st.toast("Saved")
-
-                            st.session_state.last_update = {
-                                "sku": sku,
-                                "status": "success",
-                                "request": payload,
-                                "response": response,
                                 "diff": diff,
                             }
+                            continue
 
-                        fresh_custom = {
-                            attr.get("attribute_code"): attr.get("value")
-                            for attr in (product_state.get("custom_attributes") or [])
-                            if attr.get("attribute_code")
-                        }
-                        fresh_ext = product_state.get("extension_attributes") or {}
-                        new_category_ids = []
-                        for link in fresh_ext.get("category_links") or []:
-                            if not isinstance(link, dict):
-                                continue
-                            cid = link.get("category_id")
-                            if cid in (None, ""):
-                                continue
-                            try:
-                                new_category_ids.append(int(cid))
-                            except (TypeError, ValueError):
-                                continue
+                        st.toast("Saved")
 
-                        st.session_state["original_attrs"][sku] = {
-                            **fresh_custom,
-                            "category_ids": list(new_category_ids),
+                        st.session_state.last_update = {
+                            "sku": sku,
+                            "status": "success",
+                            "request": payload,
+                            "response": response,
+                            "diff": diff,
                         }
 
-                        st.session_state.product_details[sku] = product_state
+                        try:
+                            fresh_state = client.get_product(sku)
+                        except Exception as exc:
+                            st.warning(f"Failed to refresh product {sku}: {exc}")
+                            fresh_state = {}
 
-                        for prod in st.session_state.products:
-                            if prod.get("sku") == sku:
-                                prod["custom_attributes"] = product_state.get(
-                                    "custom_attributes", []
+                        if isinstance(fresh_state, dict) and fresh_state:
+                            st.session_state.product_details[sku] = fresh_state
+
+                            fresh_custom = {
+                                attr.get("attribute_code"): attr.get("value")
+                                for attr in (fresh_state.get("custom_attributes") or [])
+                                if attr.get("attribute_code")
+                            }
+                            fresh_ext = fresh_state.get("extension_attributes") or {}
+                            new_category_ids: List[int] = []
+                            for link in fresh_ext.get("category_links") or []:
+                                if not isinstance(link, dict):
+                                    continue
+                                cid = link.get("category_id")
+                                if cid in (None, ""):
+                                    continue
+                                try:
+                                    new_category_ids.append(int(cid))
+                                except (TypeError, ValueError):
+                                    continue
+
+                            st.session_state["original_attrs"][sku] = {
+                                **fresh_custom,
+                                "category_ids": list(new_category_ids),
+                            }
+
+                            custom_attrs = fresh_custom
+                            ext_attrs = fresh_ext
+                            current_categories = list(new_category_ids)
+
+                            display_values = dict(custom_attrs)
+                            if new_category_ids:
+                                display_values["category_ids"] = ",".join(
+                                    str(cid) for cid in new_category_ids
                                 )
-                                prod["extension_attributes"] = product_state.get(
-                                    "extension_attributes", {}
-                                )
-                                break
 
-                        display_values.update(fresh_custom)
-                        if new_category_ids:
-                            display_values["category_ids"] = ",".join(
-                                str(cid) for cid in new_category_ids
-                            )
-                        render_view_table(display_values)
+                            for prod in st.session_state.products:
+                                if prod.get("sku") == sku:
+                                    prod["custom_attributes"] = fresh_state.get(
+                                        "custom_attributes", []
+                                    )
+                                    prod["extension_attributes"] = fresh_state.get(
+                                        "extension_attributes", {}
+                                    )
+                                    break
 
-                        _initialise_form_state(force_reset=True)
+                            render_view_table(display_values)
+
+                            _initialise_form_state(force_reset=True)
 
         if st.session_state.last_update:
             with st.expander("Last update payload", expanded=False):

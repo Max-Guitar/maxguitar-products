@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import logging
 import html
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
 
 from rapidfuzz import fuzz
 from ruamel.yaml import YAML
@@ -23,6 +24,9 @@ ATTR_TYPE_OVERRIDES: Dict[str, str] = {
 
 BOOL_TRUE = {"1", "true", "yes", "y", "on"}
 BOOL_FALSE = {"0", "false", "no", "n", "off"}
+
+
+logger = logging.getLogger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -104,21 +108,27 @@ def _ensure_sequence(raw: Any) -> List[Any]:
 
 def _options_from_meta(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
     options: Sequence[Any] = meta.get("options") or []
-    normalized: List[Dict[str, Any]] = []
+    normalised: List[Dict[str, Any]] = []
     for option in options:
         if not isinstance(option, dict):
             continue
-        option_id = option.get("value")
-        if option_id in (None, ""):
+        raw_value = option.get("value")
+        if raw_value in (None, ""):
             continue
-        id_str = str(option_id).strip()
-        if not id_str:
+        value_str = str(raw_value).strip()
+        if not value_str:
             continue
-        label = option.get("label") or option.get("label_default") or option.get("labelDefault")
-        label_str = str(label) if label is not None else id_str
-        candidates: List[str] = []
+        try:
+            option_id = int(value_str)
+        except ValueError:
+            logger.debug(
+                "Skipping non-numeric option id", extra={"value": raw_value}
+            )
+            continue
+
+        tokens: set[str] = set()
         for candidate in (
-            id_str,
+            value_str,
             option.get("raw_value"),
             option.get("value"),
             option.get("label"),
@@ -127,17 +137,17 @@ def _options_from_meta(meta: Dict[str, Any]) -> List[Dict[str, Any]]:
         ):
             if candidate in (None, ""):
                 continue
-            candidate_str = str(candidate)
-            if candidate_str not in candidates:
-                candidates.append(candidate_str)
-        normalized.append(
-            {
-                "id": id_str,
-                "label": label_str,
-                "candidates": candidates,
-            }
-        )
-    return normalized
+            if isinstance(candidate, (list, tuple, set)):
+                iter_values: Iterable[Any] = candidate
+            else:
+                iter_values = [candidate]
+            for item in iter_values:
+                token = _normalise_option_token(item)
+                if token:
+                    tokens.add(token)
+
+        normalised.append({"id": option_id, "value": value_str, "tokens": tokens})
+    return normalised
 
 
 def _normalise_option_token(value: Any) -> Optional[str]:
@@ -149,98 +159,109 @@ def _normalise_option_token(value: Any) -> Optional[str]:
     return text.lower()
 
 
-def resolve_option_ids(code: str, raw_value: Any, meta: Dict[str, Any]) -> List[int]:
-    options = _options_from_meta(meta)
-    id_map: Dict[str, int] = {}
-    norm_map: Dict[str, int] = {}
+_ATTRIBUTE_META_CACHE: Dict[str, Dict[str, Any]] = {}
 
-    for option in options:
-        raw_id = option.get("id")
-        if raw_id in (None, ""):
-            continue
-        id_str = str(raw_id).strip()
-        if not id_str:
-            continue
+
+def resolve_option_ids(
+    code: str,
+    raw_value: Any,
+    fetch_meta_func: Callable[[str], Dict[str, Any]],
+) -> Any:
+    """Resolve option identifiers for ``code`` based on ``raw_value``.
+
+    Returns ``int`` for select attributes and comma-separated ``str`` for
+    multiselect attributes. When no option can be determined, ``None`` is
+    returned and a warning is logged.
+    """
+
+    if raw_value in (None, ""):
+        return None
+
+    if code not in _ATTRIBUTE_META_CACHE:
         try:
-            option_id = int(id_str)
-        except ValueError as exc:
-            raise ValueError(
-                f"Option id '{raw_id}' for attribute '{code}' is not numeric"
-            ) from exc
-        id_map.setdefault(id_str, option_id)
-        norm_key = _normalise_option_token(id_str)
-        if norm_key:
-            norm_map.setdefault(norm_key, option_id)
-        for candidate in option.get("candidates", []):
-            norm_candidate = _normalise_option_token(candidate)
-            if norm_candidate:
-                norm_map.setdefault(norm_candidate, option_id)
+            meta = fetch_meta_func(code) or {}
+        except Exception as exc:  # pragma: no cover - network failure fallback
+            logger.warning(
+                "Failed to fetch attribute metadata", extra={"code": code, "error": str(exc)}
+            )
+            meta = {}
+        _ATTRIBUTE_META_CACHE[code] = deepcopy(meta)
 
-    def _match_token(token: Any, *, allow_fallback: bool) -> Optional[int]:
+    meta = deepcopy(_ATTRIBUTE_META_CACHE.get(code, {}))
+    options = _options_from_meta(meta)
+    input_type = _determine_input_type(code, meta)
+    is_multiselect = input_type == "multiselect"
+
+    id_map: Dict[str, int] = {option["value"]: option["id"] for option in options}
+    norm_map: Dict[str, int] = {}
+    for option in options:
+        for token in option.get("tokens", set()):
+            norm_map.setdefault(token, option["id"])
+
+    allow_numeric_fallback = not bool(options)
+
+    def _match_token(token: Any) -> Optional[int]:
         if token in (None, ""):
             return None
         if isinstance(token, dict):
             for key in ("option_id", "optionId", "value", "label"):
                 if key in token:
-                    resolved = _match_token(
-                        token.get(key), allow_fallback=allow_fallback
-                    )
+                    resolved = _match_token(token.get(key))
                     if resolved is not None:
                         return resolved
             return None
         if isinstance(token, (list, tuple, set)):
             for item in token:
-                resolved = _match_token(item, allow_fallback=allow_fallback)
+                resolved = _match_token(item)
                 if resolved is not None:
                     return resolved
             return None
         token_str = str(token).strip()
         if not token_str:
             return None
-        if options:
-            if token_str in id_map:
-                return id_map[token_str]
-            norm_token = _normalise_option_token(token_str)
-            if norm_token and norm_token in norm_map:
-                return norm_map[norm_token]
-            return None
-        if not allow_fallback:
-            return None
-        try:
-            return int(token_str)
-        except ValueError as exc:
-            raise ValueError(f"Value '{token}' is not a valid option for '{code}'") from exc
+        if token_str in id_map:
+            return id_map[token_str]
+        norm_token = _normalise_option_token(token_str)
+        if norm_token and norm_token in norm_map:
+            return norm_map[norm_token]
+        if allow_numeric_fallback:
+            try:
+                return int(token_str)
+            except ValueError:
+                return None
+        return None
 
-    resolved: List[int] = []
-    if raw_value is None:
-        return resolved
+    if is_multiselect:
+        candidates = _ensure_sequence(raw_value)
+    else:
+        candidates = [raw_value]
 
-    candidates = _ensure_sequence(raw_value)
+    resolved_ids: List[int] = []
+    missing_tokens: List[str] = []
+
     for candidate in candidates:
-        option_id = _match_token(candidate, allow_fallback=not bool(options))
+        option_id = _match_token(candidate)
         if option_id is None:
-            raise ValueError(f"Value '{candidate}' is not a valid option for '{code}'")
-        if option_id not in resolved:
-            resolved.append(option_id)
-    return resolved
+            missing_tokens.append(str(candidate))
+            continue
+        if option_id not in resolved_ids:
+            resolved_ids.append(option_id)
 
-
-def _normalise_multiselect(code: str, raw: Any, meta: Dict[str, Any]) -> Optional[str]:
-    option_ids = resolve_option_ids(code, raw, meta)
-    if not option_ids:
+    if not resolved_ids:
+        if missing_tokens:
+            logger.warning(
+                "Failed to resolve options", extra={"code": code, "values": missing_tokens}
+            )
         return None
-    return ",".join(str(option_id) for option_id in option_ids)
 
-
-def _normalise_select(code: str, raw: Any, meta: Dict[str, Any]) -> Optional[int]:
-    option_ids = resolve_option_ids(code, raw, meta)
-    if not option_ids:
-        return None
-    if len(option_ids) > 1:
-        raise ValueError(
-            f"Multiple option ids resolved for single-select attribute '{code}'"
+    if missing_tokens:
+        logger.warning(
+            "Partially resolved options", extra={"code": code, "values": missing_tokens}
         )
-    return option_ids[0]
+
+    if is_multiselect:
+        return ",".join(str(option_id) for option_id in resolved_ids)
+    return resolved_ids[0]
 
 
 def _determine_input_type(code: str, meta: Dict[str, Any]) -> str:
@@ -253,16 +274,22 @@ def _determine_input_type(code: str, meta: Dict[str, Any]) -> str:
     return "text"
 
 
-def normalize_value(attr_code: str, raw_value: Any, meta: Optional[Dict[str, Any]] = None) -> Any:
+def normalize_value(
+    attr_code: str,
+    raw_value: Any,
+    meta: Optional[Dict[str, Any]] = None,
+    fetch_meta_func: Optional[Callable[[str], Dict[str, Any]]] = None,
+) -> Any:
     """Normalise ``raw_value`` according to Magento attribute metadata.
 
     The function is pure: it returns a converted value without mutating the
     provided metadata.
     """
 
-    meta = deepcopy(meta or {})
-    input_type = _determine_input_type(attr_code, meta)
-    backend_type = str(meta.get("backend_type") or "").lower()
+    source_meta = meta or {}
+    meta_copy = deepcopy(source_meta)
+    input_type = _determine_input_type(attr_code, meta_copy)
+    backend_type = str(meta_copy.get("backend_type") or "").lower()
 
     if raw_value is None:
         return None
@@ -289,11 +316,17 @@ def normalize_value(attr_code: str, raw_value: Any, meta: Optional[Dict[str, Any
         except ValueError as exc:
             raise ValueError("Category ids must be integers") from exc
 
-    if input_type == "multiselect":
-        return _normalise_multiselect(attr_code, raw_value, meta)
+    if input_type in {"multiselect", "select"}:
+        if fetch_meta_func is None:
+            def _fallback_fetch(code: str) -> Dict[str, Any]:
+                if code == attr_code:
+                    return deepcopy(source_meta)
+                return {}
 
-    if input_type == "select":
-        return _normalise_select(attr_code, raw_value, meta)
+            fetcher = _fallback_fetch
+        else:
+            fetcher = fetch_meta_func
+        return resolve_option_ids(attr_code, raw_value, fetcher)
 
     if input_type in {"boolean", "bool"}:
         return _normalise_bool(raw_value)
