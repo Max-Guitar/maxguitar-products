@@ -3,7 +3,7 @@
 import json
 import sys
 from pathlib import Path
-from typing import Dict, Set
+from typing import Any, Dict, Set
 
 import httpx
 import pandas as pd
@@ -17,7 +17,7 @@ from connectors.magento import client
 from services.apply import (
     apply_product_update,
     build_product_payload,
-    normalise_attribute_value,
+    resolve_attribute_metadata,
 )
 from services.llm_extract import extract_attributes
 from services.normalize import normalize_value
@@ -32,6 +32,8 @@ st.session_state.setdefault("selected_product_id", None)
 st.session_state.setdefault("editor_open", False)
 st.session_state.setdefault("last_update", None)
 st.session_state.setdefault("generated", {})
+st.session_state.setdefault("original_attrs", {})
+st.session_state.setdefault("active_form_sku", None)
 
 
 def to_simple(value):
@@ -177,7 +179,7 @@ if st.session_state.products:
                     st.warning(f"Failed to extract specs for {sku}: {exc}")
                     continue
                 normalized = {
-                    code: normalize_value(code, str(value))
+                    code: normalize_value(code, str(value), {"input": "text"})
                     for code, value in (specs or {}).items()
                 }
                 base_filter = global_codes or set()
@@ -281,7 +283,7 @@ if st.session_state.products:
                         set_attrs = all_attrs
 
                     # Normalize attribute metadata
-                    meta = {}
+                    meta: Dict[str, Dict[str, Any]] = {}
                     for a in (set_attrs if isinstance(set_attrs, list) else []):
                         code = (
                             a.get("attribute_code")
@@ -298,48 +300,76 @@ if st.session_state.products:
                             or a.get("frontendInput")
                             or "text",
                             "options": a.get("options") or [],
-                            "group": "",  # group data may be unavailable via API; hide the column
+                            "group": "",
                         }
 
-                    # Current values on the product
-                    curr = {
+                    custom_attrs = {
                         attr.get("attribute_code"): attr.get("value")
                         for attr in (prod_full.get("custom_attributes") or [])
                         if attr.get("attribute_code")
                     }
+                    ext_attrs = prod_full.get("extension_attributes") or {}
+                    category_links = ext_attrs.get("category_links") or []
+                    current_categories = []
+                    for link in category_links if isinstance(category_links, list) else []:
+                        if not isinstance(link, dict):
+                            continue
+                        cid = link.get("category_id")
+                        if cid in (None, ""):
+                            continue
+                        try:
+                            current_categories.append(int(cid))
+                        except (TypeError, ValueError):
+                            continue
+
+                    display_values = dict(custom_attrs)
+                    if current_categories:
+                        display_values["category_ids"] = ",".join(
+                            str(cid) for cid in current_categories
+                        )
+
+                    st.session_state["original_attrs"][sku] = {
+                        **custom_attrs,
+                        "category_ids": list(current_categories),
+                    }
+
+                    resolved_meta = {
+                        code: resolve_attribute_metadata(code, meta.get(code, {}))
+                        for code in meta
+                    }
 
                     view_placeholder = st.empty()
-                    update_placeholder = st.empty()
 
-                    def render_view_table(current_values: Dict[str, str]):
+                    def render_view_table(current_values: Dict[str, Any]):
                         view_rows = []
-                        for code, m in sorted(meta.items()):
-                            opts = [o for o in (m["options"] or []) if isinstance(o, dict)]
-                            val_raw = current_values.get(code, "")
-                            # Преобразуем raw value -> label для отображения
-                            if opts:
-                                val_map = {
-                                    str(o.get("value")): str(o.get("label")) for o in opts
+                        for code, m in sorted(resolved_meta.items()):
+                            opts = m.get("options") or []
+                            input_type = str(m.get("input") or "").lower()
+                            raw_value = current_values.get(code, "")
+                            if code == "category_ids":
+                                raw_value = display_values.get("category_ids", "")
+                            if opts and isinstance(opts, list):
+                                value_map = {
+                                    str(opt.get("value")): str(opt.get("label"))
+                                    for opt in opts
+                                    if isinstance(opt, dict)
                                 }
-                                if (
-                                    isinstance(val_raw, str)
-                                    and "," in val_raw
-                                    and (m["input"] or "").lower() == "multiselect"
-                                ):
+                                if input_type == "multiselect" and isinstance(raw_value, str):
                                     labels = [
-                                        val_map.get(x.strip(), x.strip())
-                                        for x in val_raw.split(",")
+                                        value_map.get(part.strip(), part.strip())
+                                        for part in raw_value.split(",")
+                                        if part.strip()
                                     ]
-                                    val_disp = ", ".join([x for x in labels if x])
+                                    display_val = ", ".join(labels)
                                 else:
-                                    val_disp = val_map.get(str(val_raw), str(val_raw))
+                                    display_val = value_map.get(str(raw_value), str(raw_value))
                             else:
-                                val_disp = str(val_raw)
+                                display_val = str(raw_value)
                             view_rows.append(
                                 {
                                     "attribute_code": code,
-                                    "label": m["label"],
-                                    "value": val_disp,
+                                    "label": meta.get(code, {}).get("label", code),
+                                    "value": display_val,
                                 }
                             )
 
@@ -349,297 +379,273 @@ if st.session_state.products:
                                 hide_index=True,
                                 use_container_width=True,
                             )
-                        elif current_values:
-                            st.warning(
-                                "No attribute metadata available; showing current custom attributes only."
-                            )
-                            fallback_rows = [
-                                {"attribute_code": k, "label": k, "value": str(v)}
-                                for k, v in sorted(current_values.items())
-                            ]
-                            view_placeholder.dataframe(
-                                pd.DataFrame(fallback_rows),
-                                hide_index=True,
-                                use_container_width=True,
-                            )
 
-                    render_view_table(curr)
-
-                    def render_update_report():
-                        update_placeholder.empty()
-                        last_update = st.session_state.get("last_update") or {}
-                        if last_update.get("sku") != sku:
-                            return
-                        status = last_update.get("status") or "info"
-                        with update_placeholder.container():
-                            if status == "success":
-                                st.success(f"Attributes saved for {sku}")
-                            elif status == "error":
-                                st.error(f"Failed to update {sku}")
-                            else:
-                                st.info(f"Update status for {sku}")
-                            st.json(
-                                {
-                                    "request": last_update.get("request"),
-                                    "diff": last_update.get("diff"),
-                                    "response": last_update.get("response"),
-                                }
-                            )
-
-                    render_update_report()
+                    render_view_table(display_values)
 
                     st.markdown("#### Edit values")
-                    with st.form(key=f"attr_form_{sku}", clear_on_submit=False):
-                        new_values = {}
-                        edit_targets = (
-                            sorted(meta.keys()) if meta else sorted(curr.keys())
-                        )
-                        for code in edit_targets:
-                            m = meta.get(
-                                code,
-                                {"label": code, "input": "text", "options": []},
+
+                    def _widget_default(code: str, attr_meta: Dict[str, Any]) -> Any:
+                        raw = display_values.get(code, "")
+                        input_type = str(attr_meta.get("input") or "").lower()
+                        if code == "category_ids":
+                            return ",".join(str(cid) for cid in current_categories)
+                        if input_type == "multiselect":
+                            if isinstance(raw, list):
+                                return [str(v) for v in raw]
+                            if isinstance(raw, str):
+                                return [part.strip() for part in raw.split(",") if part.strip()]
+                            return []
+                        if input_type == "select":
+                            return str(raw) if raw not in (None, "") else None
+                        if input_type in {"boolean", "bool"}:
+                            lowered = str(raw).strip().lower()
+                            if lowered in {"1", "true", "yes", "on"}:
+                                return 1
+                            if lowered in {"0", "false", "no", "off"}:
+                                return 0
+                            return None
+                        return str(raw or "")
+
+                    edit_codes = sorted(resolved_meta.keys())
+
+                    if st.session_state.get("active_form_sku") != sku:
+                        for code in edit_codes:
+                            st.session_state[f"attr_{code}"] = _widget_default(
+                                code, resolved_meta.get(code, {})
                             )
-                            label = m["label"]
-                            input_type = (m.get("input") or "").lower()
-                            opts = [
-                                o for o in (m.get("options") or []) if isinstance(o, dict)
-                            ]
-                            current_raw = curr.get(code, "")
+                        st.session_state["active_form_sku"] = sku
 
-                            if opts:
-                                labels = [str(o.get("label")) for o in opts]
-                                lbl_to_val = {
-                                    str(o.get("label")): str(o.get("value")) for o in opts
-                                }
-                                # Текущее значение -> label
-                                if input_type == "multiselect":
-                                    cur_labels = []
-                                    if isinstance(current_raw, str) and current_raw:
-                                        for v in [
-                                            x.strip()
-                                            for x in current_raw.split(",")
-                                            if x.strip()
-                                        ]:
-                                            found = next(
-                                                (
-                                                    str(o.get("label"))
-                                                    for o in opts
-                                                    if str(o.get("value")) == v
-                                                ),
-                                                v,
-                                            )
-                                            cur_labels.append(found)
-                                    sel = st.multiselect(
-                                        label,
-                                        labels,
-                                        default=cur_labels,
-                                        key=f"{sku}_{code}",
-                                    )
-                                    mapped = [lbl_to_val.get(s, s) for s in sel]
-                                    new_values[code] = ",".join(mapped)
-                                else:
-                                    cur_label = next(
-                                        (
-                                            str(o.get("label"))
-                                            for o in opts
-                                            if str(o.get("value"))
-                                            == str(current_raw)
-                                        ),
-                                        str(current_raw),
-                                    )
-                                    sel = st.selectbox(
-                                        label,
-                                        labels,
-                                        index=(
-                                            labels.index(cur_label)
-                                            if cur_label in labels
-                                            else 0
-                                        )
-                                        if labels
-                                        else None,
-                                        key=f"{sku}_{code}",
-                                    )
-                                    new_values[code] = lbl_to_val.get(sel, sel)
-                            else:
-                                new_values[code] = st.text_input(
+                    with st.form(key="attr_editor", clear_on_submit=False):
+                        for code in edit_codes:
+                            attr_meta = resolved_meta.get(
+                                code, {"label": code, "input": "text", "options": []}
+                            )
+                            label = meta.get(code, {}).get("label", code)
+                            input_type = str(attr_meta.get("input") or "").lower()
+                            options = attr_meta.get("options") or []
+                            state_key = f"attr_{code}"
+
+                            if code == "category_ids":
+                                st.text_input(
                                     label,
-                                    value=str(current_raw or ""),
-                                    key=f"{sku}_{code}",
+                                    value=st.session_state.get(state_key, ""),
+                                    key=state_key,
                                 )
+                                continue
 
-                        submitted = st.form_submit_button(
-                            f"💾 Save attributes for {sku}"
-                        )
-                        if submitted:
-                            st.session_state["editor_open"] = True
-                            st.session_state["selected_product_id"] = to_simple(sku)
-
-                            errors = []
-                            cleaned_values = {}
-                            for code, val in new_values.items():
-                                attr_meta = meta.get(
-                                    code,
-                                    {"label": code, "input": "text", "options": []},
+                            if input_type == "multiselect" and options:
+                                option_values = [
+                                    opt.get("value")
+                                    for opt in options
+                                    if isinstance(opt, dict) and opt.get("value") not in (None, "")
+                                ]
+                                label_map = {
+                                    str(opt.get("value")): str(opt.get("label"))
+                                    for opt in options
+                                    if isinstance(opt, dict)
+                                }
+                                st.multiselect(
+                                    label,
+                                    option_values,
+                                    default=st.session_state.get(state_key, []),
+                                    key=state_key,
+                                    format_func=lambda v, lm=label_map: lm.get(str(v), str(v)),
                                 )
-                                try:
-                                    normalised = normalise_attribute_value(
-                                        code, val, attr_meta
+                                continue
+
+                            if input_type == "select" and options:
+                                option_values = [
+                                    opt.get("value")
+                                    for opt in options
+                                    if isinstance(opt, dict) and opt.get("value") not in (None, "")
+                                ]
+                                label_map = {
+                                    str(opt.get("value")): str(opt.get("label"))
+                                    for opt in options
+                                    if isinstance(opt, dict)
+                                }
+                                default_value = st.session_state.get(state_key)
+                                if default_value not in option_values and option_values:
+                                    default_value = option_values[0]
+                                    st.session_state[state_key] = default_value
+                                st.selectbox(
+                                    label,
+                                    option_values,
+                                    index=option_values.index(default_value)
+                                    if default_value in option_values
+                                    else 0,
+                                    key=state_key,
+                                    format_func=lambda v, lm=label_map: lm.get(str(v), str(v)),
+                                )
+                                continue
+
+                            if input_type in {"boolean", "bool"}:
+                                bool_options = [1, 0]
+                                labels = {1: "Yes", 0: "No"}
+                                default_val = st.session_state.get(state_key, 0)
+                                if default_val not in bool_options:
+                                    default_val = 0
+                                    st.session_state[state_key] = default_val
+                                st.selectbox(
+                                    label,
+                                    bool_options,
+                                    index=bool_options.index(default_val),
+                                    key=state_key,
+                                    format_func=lambda v, lm=labels: lm.get(v, str(v)),
+                                )
+                                continue
+
+                            st.text_input(
+                                label,
+                                value=st.session_state.get(state_key, ""),
+                                key=state_key,
+                            )
+
+                        submitted = st.form_submit_button("Save attributes")
+
+                    if submitted:
+                        st.session_state["editor_open"] = True
+                        st.session_state["selected_product_id"] = to_simple(sku)
+
+                        form_data = {
+                            code: st.session_state.get(f"attr_{code}")
+                            for code in edit_codes
+                        }
+
+                        original_snapshot = st.session_state["original_attrs"].get(sku, {})
+                        try:
+                            diff, resolved, payload = build_product_payload(
+                                sku,
+                                form_data,
+                                meta,
+                                original_attributes=original_snapshot,
+                                original_extension_attributes=ext_attrs,
+                            )
+                        except ValueError as exc:
+                            st.error(f"Failed to build product payload: {exc}")
+                            continue
+
+                        if not diff:
+                            st.toast("No changes")
+                            continue
+
+                        st.code(json.dumps(diff, indent=2))
+                        st.code(json.dumps(payload.get("product", {}), indent=2))
+
+                        with st.spinner("Saving attributes to Magento…"):
+                            try:
+                                response, mismatches, product_state = apply_product_update(
+                                    sku, diff, resolved, payload
+                                )
+                            except httpx.HTTPStatusError as exc:
+                                status_code = getattr(exc.response, "status_code", None)
+                                request_url = getattr(exc.request, "url", "Unknown URL")
+                                request_body = getattr(exc.request, "content", b"")
+                                if isinstance(request_body, bytes):
+                                    request_body = request_body.decode(
+                                        "utf-8", errors="replace"
                                     )
-                                except ValueError as exc:
-                                    errors.append(f"{code}: {exc}")
-                                    continue
-                                if normalised is None or normalised == "":
-                                    continue
-                                cleaned_values[code] = normalised
-
-                            if errors:
-                                for err in errors:
-                                    st.error(f"⚠️ Unable to normalise {err}")
-                            elif not cleaned_values:
-                                st.info("Nothing to update.")
-                            else:
-                                try:
-                                    payload = build_product_payload(
-                                        sku,
-                                        cleaned_values,
-                                        meta,
-                                        original_attributes=curr,
-                                        original_extension_attributes=prod_full.get(
-                                            "extension_attributes", {}
-                                        ),
+                                response_text = getattr(exc.response, "text", "")
+                                st.error(
+                                    "\n".join(
+                                        [
+                                            "❌ Failed to save attributes:",
+                                            f"Status: {status_code or '?'}",
+                                            f"URL: {request_url}",
+                                            "Request body:",
+                                            request_body or "<empty request body>",
+                                            "Response text:",
+                                            response_text or "<empty response>",
+                                        ]
                                     )
-                                except ValueError as exc:
-                                    st.error(
-                                        f"Failed to build product payload: {exc}"
-                                    )
-                                else:
-                                    st.code(json.dumps(cleaned_values, indent=2))
-                                    product_payload = payload.get("product", {})
-                                    st.code(json.dumps(product_payload, indent=2))
+                                )
+                                st.session_state.last_update = {
+                                    "sku": sku,
+                                    "status": "error",
+                                    "request": payload,
+                                    "response": {
+                                        "status_code": status_code,
+                                        "body": response_text,
+                                    },
+                                }
+                                continue
+                            except Exception as exc:
+                                st.error(f"Unexpected error: {exc}")
+                                st.session_state.last_update = {
+                                    "sku": sku,
+                                    "status": "error",
+                                    "request": payload,
+                                    "response": {"error": str(exc)},
+                                }
+                                continue
 
-                                    with st.spinner("Saving attributes to Magento…"):
-                                        try:
-                                            response = apply_product_update(
-                                                sku,
-                                                cleaned_values,
-                                                meta,
-                                                payload=payload,
-                                                original_attributes=curr,
-                                                original_extension_attributes=prod_full.get(
-                                                    "extension_attributes", {}
-                                                ),
-                                            )
-                                            st.toast("Saved")
-                                        except httpx.HTTPStatusError as exc:
-                                            status_code = getattr(
-                                                exc.response, "status_code", None
-                                            )
-                                            request_url = getattr(
-                                                exc.request, "url", "Unknown URL"
-                                            )
-                                            request_body = getattr(
-                                                exc.request, "content", b""
-                                            )
-                                            if isinstance(request_body, bytes):
-                                                request_body = request_body.decode(
-                                                    "utf-8", errors="replace"
-                                                )
-                                            response_text = getattr(
-                                                exc.response, "text", ""
-                                            )
-                                            status_display = status_code or "?"
-                                            st.error(
-                                                "\n".join(
-                                                    [
-                                                        "❌ Failed to save attributes:",
-                                                        f"Status: {status_display}",
-                                                        f"URL: {request_url}",
-                                                        "Request body:",
-                                                        request_body
-                                                        or "<empty request body>",
-                                                        "Response text:",
-                                                        response_text
-                                                        or "<empty response>",
-                                                    ]
-                                                )
-                                            )
+                        if mismatches:
+                            st.error("Not applied")
+                            st.json(mismatches)
+                            st.session_state.last_update = {
+                                "sku": sku,
+                                "status": "error",
+                                "request": payload,
+                                "response": {"mismatches": mismatches},
+                            }
+                            continue
 
-                                            st.session_state.last_update = {
-                                                "sku": sku,
-                                                "status": "error",
-                                                "request": payload,
-                                                "response": {
-                                                    "status_code": status_code,
-                                                    "body": getattr(
-                                                        exc.response, "text", None
-                                                    ),
-                                                },
-                                            }
-                                            render_update_report()
-                                        except Exception as exc:
-                                            st.error(f"Unexpected error: {exc}")
-                                            st.session_state.last_update = {
-                                                "sku": sku,
-                                                "status": "error",
-                                                "request": payload,
-                                                "response": {"error": str(exc)},
-                                            }
-                                            render_update_report()
-                                        else:
-                                            diff = {
-                                                code: {
-                                                    "previous": curr.get(code),
-                                                    "new": value,
-                                                }
-                                                for code, value in cleaned_values.items()
-                                                if curr.get(code) != value
-                                            }
-                                            generated_map = st.session_state.get("generated", {})
-                                            generated_map.setdefault(sku, {}).update(
-                                                cleaned_values
-                                            )
-                                            st.session_state.generated = generated_map
-                                            st.session_state.last_update = {
-                                                "sku": sku,
-                                                "status": "success",
-                                                "request": payload,
-                                                "response": response,
-                                                "diff": diff,
-                                            }
+                        st.toast("Saved")
 
-                                            custom_attr_updates = {
-                                                code: value
-                                                for code, value in cleaned_values.items()
-                                                if code
-                                                not in {
-                                                    "category_ids",
-                                                    "quantity_and_stock_status",
-                                                }
-                                            }
-                                            curr.update(custom_attr_updates)
-                                            for forbidden in (
-                                                "category_ids",
-                                                "quantity_and_stock_status",
-                                            ):
-                                                curr.pop(forbidden, None)
-                                            prod_full["custom_attributes"] = [
-                                                {
-                                                    "attribute_code": code,
-                                                    "value": value,
-                                                }
-                                                for code, value in curr.items()
-                                            ]
-                                            st.session_state.product_details[sku] = prod_full
+                        st.session_state.last_update = {
+                            "sku": sku,
+                            "status": "success",
+                            "request": payload,
+                            "response": response,
+                            "diff": diff,
+                        }
 
-                                            for prod in st.session_state.products:
-                                                if prod.get("sku") == sku:
-                                                    prod["custom_attributes"] = prod_full.get(
-                                                        "custom_attributes", []
-                                                    )
-                                                    break
+                        fresh_custom = {
+                            attr.get("attribute_code"): attr.get("value")
+                            for attr in (product_state.get("custom_attributes") or [])
+                            if attr.get("attribute_code")
+                        }
+                        fresh_ext = product_state.get("extension_attributes") or {}
+                        new_category_ids = []
+                        for link in fresh_ext.get("category_links") or []:
+                            if not isinstance(link, dict):
+                                continue
+                            cid = link.get("category_id")
+                            if cid in (None, ""):
+                                continue
+                            try:
+                                new_category_ids.append(int(cid))
+                            except (TypeError, ValueError):
+                                continue
 
-                                            render_view_table(curr)
-                                            render_update_report()
+                        st.session_state["original_attrs"][sku] = {
+                            **fresh_custom,
+                            "category_ids": list(new_category_ids),
+                        }
+
+                        st.session_state.product_details[sku] = product_state
+
+                        for prod in st.session_state.products:
+                            if prod.get("sku") == sku:
+                                prod["custom_attributes"] = product_state.get(
+                                    "custom_attributes", []
+                                )
+                                prod["extension_attributes"] = product_state.get(
+                                    "extension_attributes", {}
+                                )
+                                break
+
+                        display_values.update(fresh_custom)
+                        if new_category_ids:
+                            display_values["category_ids"] = ",".join(
+                                str(cid) for cid in new_category_ids
+                            )
+                        render_view_table(display_values)
+
+                        for code in edit_codes:
+                            st.session_state[f"attr_{code}"] = _widget_default(
+                                code, resolved_meta.get(code, {})
+                            )
 
         if st.session_state.last_update:
             with st.expander("Last update payload", expanded=False):

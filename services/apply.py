@@ -1,17 +1,16 @@
-"""Utilities for persisting enriched product attributes back to Magento."""
+"""Utilities for building and applying Magento product updates."""
 
 from __future__ import annotations
 
-import ast
-import html
 import json
 import logging
-import re
-from typing import Any, Dict, Iterable, List, Optional
+from copy import deepcopy
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 
 from connectors.magento import client
+from services.normalize import normalize_value
 
 try:  # pragma: no cover - Streamlit is optional in test environments.
     import streamlit as st
@@ -21,7 +20,7 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-STATIC_ATTRIBUTE_CODES = {
+NON_EDITABLE_CODES = {
     "has_options",
     "required_options",
     "quantity_and_stock_status",
@@ -30,339 +29,196 @@ STATIC_ATTRIBUTE_CODES = {
     "thumbnail",
 }
 
-
-def _looks_like_float(candidate: str) -> bool:
-    try:
-        float(candidate)
-    except ValueError:
-        return False
-    return True
+_ATTRIBUTE_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
-def _normalise_int_list(value: Any) -> List[int]:
-    """Return a sorted, de-duplicated list of ints parsed from ``value``."""
-
-    if value is None:
-        return []
-
-    items: Iterable[Any]
-    original = value
-    if isinstance(value, str):
-        trimmed = value.strip()
-        if not trimmed:
-            return []
-        parsed = None
-        try:
-            parsed = ast.literal_eval(trimmed)
-        except (ValueError, SyntaxError):
-            parsed = None
-        if isinstance(parsed, (list, tuple, set)):
-            items = parsed
-        else:
-            found = re.findall(r"\d+", trimmed)
-            if found:
-                items = found
-            else:
-                parts = [p.strip() for p in trimmed.split(",") if p.strip()]
-                items = parts or []
-    elif isinstance(value, (list, tuple, set)):
-        items = value
-    else:
-        items = [value]
-
-    ints: List[int] = []
-    for item in items:
-        if isinstance(item, (list, tuple, set)):
-            ints.extend(_normalise_int_list(item))
+def _normalise_options(options: Any) -> list[dict[str, str]]:
+    normalised: list[dict[str, str]] = []
+    if not isinstance(options, list):
+        return normalised
+    for option in options:
+        if not isinstance(option, dict):
             continue
-        if isinstance(item, str):
-            stripped = item.strip()
-            if not stripped:
-                continue
-            if re.fullmatch(r"-?\d+", stripped):
-                ints.append(int(stripped))
-                continue
-            digits = re.findall(r"-?\d+", stripped)
-            if digits:
-                ints.extend(int(d) for d in digits)
-                continue
-            raise ValueError(f"Cannot parse integer from '{item}'")
+        raw_value = option.get("value")
+        if raw_value in (None, ""):
+            continue
+        label = (
+            option.get("label")
+            or option.get("label_default")
+            or option.get("labelDefault")
+            or option.get("default_label")
+        )
+        normalised.append(
+            {
+                "value": str(raw_value),
+                "label": str(label) if label is not None else str(raw_value),
+            }
+        )
+    return normalised
+
+
+def resolve_attribute_metadata(code: str, fallback: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return merged metadata for ``code`` combining API data with ``fallback``."""
+
+    if code not in _ATTRIBUTE_CACHE:
         try:
-            ints.append(int(item))
+            remote = client.get_attribute(code) or {}
+        except Exception as exc:  # pragma: no cover - network failure fallback
+            logger.warning("Failed to load attribute metadata", extra={"code": code, "error": str(exc)})
+            remote = {}
+
+        options = remote.get("options")
+        if not options:
+            try:
+                options = client.get_attribute_options(code)
+            except Exception:  # pragma: no cover - optional endpoint
+                options = []
+
+        merged = {
+            "attribute_code": remote.get("attribute_code") or code,
+            "frontend_input": remote.get("frontend_input") or remote.get("input"),
+            "backend_type": remote.get("backend_type"),
+            "frontend_class": remote.get("frontend_class"),
+            "options": _normalise_options(options),
+        }
+        merged["input"] = merged.get("frontend_input")
+        _ATTRIBUTE_CACHE[code] = merged
+
+    resolved = deepcopy(_ATTRIBUTE_CACHE[code])
+    if fallback:
+        for key, value in fallback.items():
+            if key == "options" and value:
+                resolved.setdefault("options", [])
+                resolved["options"] = _normalise_options(list(value)) or resolved["options"]
+                continue
+            if value not in (None, ""):
+                resolved[key] = value
+        if "input" not in resolved and fallback.get("frontend_input"):
+            resolved["input"] = fallback["frontend_input"]
+    return resolved
+
+
+def _extract_custom_attributes(product: Dict[str, Any]) -> Dict[str, Any]:
+    attributes: Dict[str, Any] = {}
+    for attr in product.get("custom_attributes", []) or []:
+        if not isinstance(attr, dict):
+            continue
+        code = attr.get("attribute_code")
+        if not code:
+            continue
+        attributes[str(code)] = attr.get("value")
+    return attributes
+
+
+def _extract_category_ids(source: Optional[Dict[str, Any]]) -> list[int]:
+    if not source:
+        return []
+    links = source.get("category_links") or []
+    if not isinstance(links, list):
+        return []
+    result: list[int] = []
+    for link in links:
+        if not isinstance(link, dict):
+            continue
+        cid = link.get("category_id")
+        if cid in (None, ""):
+            continue
+        try:
+            result.append(int(cid))
         except (TypeError, ValueError):
-            raise ValueError(f"Cannot parse integer from '{item}'") from None
-
-    if not ints and original not in (None, "", [], (), set()):
-        raise ValueError("No numeric values found")
-
-    # De-duplicate while preserving order, then sort for deterministic output.
-    seen = []
-    for item in ints:
-        if item not in seen:
-            seen.append(item)
-    return sorted(seen)
-
-
-def _normalise_single_int(value: Any) -> Optional[int]:
-    numbers = _normalise_int_list(value)
-    if not numbers:
-        return None
-    if len(numbers) > 1:
-        raise ValueError("Expected a single numeric value")
-    return numbers[0]
-
-
-def _normalise_bool_flag(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return 1 if value else 0
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return 1 if int(value) else 0
-    if isinstance(value, str):
-        trimmed = value.strip()
-        if not trimmed:
-            return None
-        lowered = trimmed.lower()
-        if lowered in {"1", "true", "yes", "on"}:
-            return 1
-        if lowered in {"0", "false", "no", "off"}:
-            return 0
-    raise ValueError("Expected a boolean-like value")
-
-
-def _generic_normalise(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        trimmed = value.strip()
-        if not trimmed:
-            return None
-        if "," in trimmed:
-            parts = [p.strip() for p in trimmed.split(",") if p.strip()]
-            converted_parts: List[str] = []
-            for part in parts:
-                lowered = part.lower()
-                if re.fullmatch(r"-?\d+", part):
-                    converted = int(part)
-                elif lowered in {"true", "false"}:
-                    converted = lowered == "true"
-                elif _looks_like_float(part):
-                    converted = float(part)
-                else:
-                    converted = part
-                converted_parts.append(str(converted))
-            return ",".join(converted_parts)
-        if re.fullmatch(r"-?\d+", trimmed):
-            return int(trimmed)
-        lowered = trimmed.lower()
-        if lowered in {"true", "false"}:
-            return lowered == "true"
-        if _looks_like_float(trimmed):
-            return float(trimmed)
-        return trimmed
-    if isinstance(value, (int, float, bool)):
-        return value
-    return value
-
-
-def normalise_attribute_value(
-    code: str,
-    value: Any,
-    attr_meta: Optional[Dict[str, Any]] = None,
-) -> Any:
-    """Return a normalised value for the provided attribute metadata."""
-
-    if value is None:
-        return None
-    if isinstance(value, str) and not value.strip():
-        return None
-
-    attr_meta = attr_meta or {}
-    input_type = str(attr_meta.get("input") or "").lower()
-
-    if code == "description" and isinstance(value, str):
-        cleaned = html.unescape(value)
-        cleaned = cleaned.replace("\\\\", "\\").replace("\\", "")
-        return cleaned if cleaned.strip() else None
-    if code == "custom_layout_update_file":
-        if value is None:
-            return None
-        if isinstance(value, str):
-            trimmed = value.strip()
-        else:
-            trimmed = str(value).strip()
-        if not trimmed:
-            return None
-        if trimmed in {"__no_update__", "no_update"}:
-            return None
-        return trimmed
-    if code == "quantity_and_stock_status":
-        return None
-    if code == "options_container":
-        if value is None:
-            return None
-        if isinstance(value, str):
-            trimmed = value.strip()
-            if not trimmed:
-                return None
-            lowered = trimmed.lower()
-            if lowered.startswith("container"):
-                return lowered
-            if re.fullmatch(r"\d+", trimmed):
-                return f"container{trimmed}"
-            return trimmed
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if isinstance(value, float):
-                if value.is_integer():
-                    number_str = format(value, ".0f")
-                else:
-                    number_str = format(value, "g")
-            else:
-                number_str = str(value)
-            return f"container{number_str}"
-        return str(value)
-    if code == "category_ids":
-        return _normalise_int_list(value)
-    if input_type == "multiselect":
-        return _normalise_int_list(value)
-    if input_type == "select":
-        return _normalise_single_int(value)
-    if input_type in {"boolean", "bool"}:
-        return _normalise_bool_flag(value)
-
-    return _generic_normalise(value)
+            continue
+    return result
 
 
 def build_product_payload(
     sku: Any,
-    attributes: Dict[str, Any],
+    form_data: Dict[str, Any],
     metadata: Optional[Dict[str, Dict[str, Any]]] = None,
     *,
     original_attributes: Optional[Dict[str, Any]] = None,
     original_extension_attributes: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Return a Magento product payload respecting attribute types."""
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Return ``(diff, resolved_metadata, payload)`` for the provided form input."""
 
     metadata = metadata or {}
-    custom_attributes: List[Dict[str, Any]] = []
-    extension_attributes: Dict[str, Any] = {}
-
     original_attributes = original_attributes or {}
     original_extension_attributes = original_extension_attributes or {}
 
-    for code, raw_value in attributes.items():
-        attr_meta = metadata.get(code, {})
+    diff: Dict[str, Any] = {}
+    resolved_meta: Dict[str, Dict[str, Any]] = {}
 
-        if code in STATIC_ATTRIBUTE_CODES:
+    for code, raw_value in form_data.items():
+        if code in NON_EDITABLE_CODES:
             continue
 
-        normalised = normalise_attribute_value(code, raw_value, attr_meta)
-        if normalised is None:
+        attr_meta = resolve_attribute_metadata(code, metadata.get(code, {}))
+        resolved_meta[code] = attr_meta
+
+        try:
+            normalised_new = normalize_value(code, raw_value, attr_meta)
+        except ValueError as exc:
+            raise ValueError(f"{code}: {exc}") from exc
+
+        if code == "category_ids" and not original_attributes.get(code):
+            current_categories = _extract_category_ids(original_extension_attributes)
+            baseline = normalize_value(code, current_categories, attr_meta)
+        else:
+            baseline = normalize_value(code, original_attributes.get(code), attr_meta)
+
+        if normalised_new is None or normalised_new == baseline:
             continue
 
-        if code == "category_ids":
-            if not isinstance(normalised, list):
-                raise ValueError("Attribute 'category_ids' must be a list of integers")
-
-            original_category_links = []
-            raw_original_categories = original_attributes.get(code)
-            if raw_original_categories is None:
-                ext_links = original_extension_attributes.get("category_links") or []
-                if isinstance(ext_links, list):
-                    raw_original_categories = [
-                        link.get("category_id") for link in ext_links if link.get("category_id")
-                    ]
-
-            original_normalised = normalise_attribute_value(
-                code,
-                raw_original_categories,
-                metadata.get(code, {}),
-            )
-            original_ids = [str(cid) for cid in (original_normalised or [])]
-            new_ids = [str(cid) for cid in normalised]
-            if new_ids != original_ids:
-                extension_attributes["category_links"] = [
-                    {"category_id": cid} for cid in new_ids
-                ]
+        if code == "custom_layout_update_file" and normalised_new is None:
+            # Skip the sentinel "no update" values entirely.
             continue
 
-        original_value = None
-        if code in original_attributes:
-            original_value = normalise_attribute_value(
-                code, original_attributes.get(code), attr_meta
-            )
+        diff[code] = normalised_new
 
-        if normalised == original_value:
+    if not diff:
+        return diff, resolved_meta, {}
+
+    product: Dict[str, Any] = {"sku": sku, "custom_attributes": []}
+    extension_attributes: Dict[str, Any] = {}
+
+    category_ids = diff.get("category_ids")
+    if category_ids is not None:
+        extension_attributes["category_links"] = [
+            {"category_id": str(cid)} for cid in category_ids
+        ]
+
+    for code, value in diff.items():
+        if code in NON_EDITABLE_CODES or code == "category_ids":
             continue
+        product["custom_attributes"].append({"attribute_code": code, "value": value})
 
-        input_type = attr_meta.get("input", "").lower()
-        if input_type == "multiselect":
-            if not isinstance(normalised, list) or any(
-                not isinstance(item, int) for item in normalised
-            ):
-                raise ValueError(
-                    f"Attribute '{code}' must be a list of integers for multiselect"
-                )
-        elif input_type == "select":
-            if code == "options_container":
-                if not isinstance(normalised, str):
-                    raise ValueError(
-                        "Attribute 'options_container' must be a string for select"
-                    )
-            elif not isinstance(normalised, int):
-                raise ValueError(f"Attribute '{code}' must be an integer for select")
-        elif input_type in {"boolean", "bool"}:
-            if normalised not in {0, 1}:
-                raise ValueError(
-                    f"Attribute '{code}' must be normalised to 0 or 1 for boolean fields"
-                )
-
-        custom_attributes.append({"attribute_code": code, "value": normalised})
-
-    product: Dict[str, Any] = {"sku": sku, "custom_attributes": custom_attributes}
     if extension_attributes:
         product["extension_attributes"] = extension_attributes
 
-    return {"product": product}
+    return diff, resolved_meta, {"product": product}
 
 
 def apply_product_update(
     sku: Any,
-    attributes: Dict[str, Any],
-    metadata: Optional[Dict[str, Dict[str, Any]]] = None,
-    payload: Optional[Dict[str, Any]] = None,
-    *,
-    original_attributes: Optional[Dict[str, Any]] = None,
-    original_extension_attributes: Optional[Dict[str, Any]] = None,
-):
-    """Send a Magento product update request for the provided SKU without retries."""
+    diff: Dict[str, Any],
+    resolved_metadata: Dict[str, Dict[str, Any]],
+    payload: Dict[str, Any],
+) -> Tuple[Any, Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """Send the Magento update request and verify the resulting state."""
 
-    # Always regenerate the payload to ensure fresh normalisation, regardless of
-    # whether a pre-built payload has been supplied.
-    final_payload = build_product_payload(
-        sku,
-        attributes,
-        metadata,
-        original_attributes=original_attributes,
-        original_extension_attributes=original_extension_attributes,
-    )
+    if not diff:
+        raise ValueError("No changes to apply")
 
-    product_payload = final_payload.get("product", {})
+    product_payload = payload.get("product", {})
     if st is not None:
-        try:  # pragma: no cover - Streamlit is optional during tests.
+        try:  # pragma: no cover - Streamlit optional during tests
             st.code(json.dumps(product_payload, indent=2))
         except Exception:
             pass
 
-    logger.info("Sending product update", extra={"sku": sku, "payload": final_payload})
+    logger.info("Sending product update", extra={"sku": sku, "payload": payload})
 
-    patch_func = getattr(client.patch, "__wrapped__", None)
     try:
-        if callable(patch_func):
-            response = patch_func(client, f"products/{sku}", final_payload)
-        else:
-            response = client.patch(f"products/{sku}", final_payload)
+        response = client.patch(f"products/{sku}", payload)
     except httpx.HTTPStatusError as exc:
         status_code = getattr(exc.response, "status_code", None)
         request_url = getattr(exc.request, "url", None)
@@ -378,7 +234,6 @@ def apply_product_update(
             "Magento update failed",
             extra={
                 "sku": sku,
-                "payload": final_payload,
                 "status_code": status_code,
                 "request_url": str(request_url) if request_url is not None else None,
                 "request_body": request_body,
@@ -388,4 +243,36 @@ def apply_product_update(
         raise
 
     logger.info("Magento update succeeded", extra={"sku": sku, "response": response})
-    return response
+
+    product_state = client.get_product(sku)
+    mismatches = _verify_diff(diff, product_state, resolved_metadata)
+    return response, mismatches, product_state
+
+
+def _verify_diff(
+    diff: Dict[str, Any],
+    product_state: Dict[str, Any],
+    metadata: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Compare ``diff`` against ``product_state`` and return mismatched fields."""
+
+    current_attrs = _extract_custom_attributes(product_state)
+    extension_attrs = product_state.get("extension_attributes") or {}
+    mismatches: Dict[str, Dict[str, Any]] = {}
+
+    for code, expected in diff.items():
+        attr_meta = metadata.get(code, {})
+        if code == "category_ids":
+            raw_current = _extract_category_ids(extension_attrs)
+        else:
+            raw_current = current_attrs.get(code)
+        current_normalised = normalize_value(code, raw_current, attr_meta)
+        if current_normalised != expected:
+            mismatches[code] = {
+                "expected": expected,
+                "actual": current_normalised,
+                "raw": raw_current,
+            }
+
+    return mismatches
+
