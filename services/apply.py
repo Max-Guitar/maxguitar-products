@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import html
+import json
 import logging
 import re
 from typing import Any, Dict, Iterable, List, Optional
@@ -11,8 +13,22 @@ import httpx
 
 from connectors.magento import client
 
+try:  # pragma: no cover - Streamlit is optional in test environments.
+    import streamlit as st
+except Exception:  # pragma: no cover
+    st = None  # type: ignore[assignment]
+
 
 logger = logging.getLogger(__name__)
+
+STATIC_ATTRIBUTE_CODES = {
+    "has_options",
+    "required_options",
+    "quantity_and_stock_status",
+    "image",
+    "small_image",
+    "thumbnail",
+}
 
 
 def _looks_like_float(candidate: str) -> bool:
@@ -165,6 +181,10 @@ def normalise_attribute_value(
     attr_meta = attr_meta or {}
     input_type = str(attr_meta.get("input") or "").lower()
 
+    if code == "description" and isinstance(value, str):
+        cleaned = html.unescape(value)
+        cleaned = cleaned.replace("\\\\", "\\").replace("\\", "")
+        return cleaned if cleaned.strip() else None
     if code == "custom_layout_update_file":
         if value is None:
             return None
@@ -218,35 +238,73 @@ def build_product_payload(
     sku: Any,
     attributes: Dict[str, Any],
     metadata: Optional[Dict[str, Dict[str, Any]]] = None,
+    *,
+    original_attributes: Optional[Dict[str, Any]] = None,
+    original_extension_attributes: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return a Magento product payload respecting attribute types."""
 
     metadata = metadata or {}
     custom_attributes: List[Dict[str, Any]] = []
-    category_links: List[Dict[str, str]] = []
+    extension_attributes: Dict[str, Any] = {}
+
+    original_attributes = original_attributes or {}
+    original_extension_attributes = original_extension_attributes or {}
 
     for code, raw_value in attributes.items():
         attr_meta = metadata.get(code, {})
+
+        if code in STATIC_ATTRIBUTE_CODES:
+            continue
+
         normalised = normalise_attribute_value(code, raw_value, attr_meta)
         if normalised is None:
             continue
+
         if code == "category_ids":
             if not isinstance(normalised, list):
                 raise ValueError("Attribute 'category_ids' must be a list of integers")
-            category_links = [
-                {"category_id": str(category_id)} for category_id in normalised
-            ]
+
+            original_category_links = []
+            raw_original_categories = original_attributes.get(code)
+            if raw_original_categories is None:
+                ext_links = original_extension_attributes.get("category_links") or []
+                if isinstance(ext_links, list):
+                    raw_original_categories = [
+                        link.get("category_id") for link in ext_links if link.get("category_id")
+                    ]
+
+            original_normalised = normalise_attribute_value(
+                code,
+                raw_original_categories,
+                metadata.get(code, {}),
+            )
+            original_ids = [str(cid) for cid in (original_normalised or [])]
+            new_ids = [str(cid) for cid in normalised]
+            if new_ids != original_ids:
+                extension_attributes["category_links"] = [
+                    {"category_id": cid} for cid in new_ids
+                ]
             continue
-        if code == "quantity_and_stock_status":
+
+        original_value = None
+        if code in original_attributes:
+            original_value = normalise_attribute_value(
+                code, original_attributes.get(code), attr_meta
+            )
+
+        if normalised == original_value:
             continue
-        if attr_meta.get("input", "").lower() == "multiselect":
+
+        input_type = attr_meta.get("input", "").lower()
+        if input_type == "multiselect":
             if not isinstance(normalised, list) or any(
                 not isinstance(item, int) for item in normalised
             ):
                 raise ValueError(
                     f"Attribute '{code}' must be a list of integers for multiselect"
                 )
-        elif attr_meta.get("input", "").lower() == "select":
+        elif input_type == "select":
             if code == "options_container":
                 if not isinstance(normalised, str):
                     raise ValueError(
@@ -254,18 +312,17 @@ def build_product_payload(
                     )
             elif not isinstance(normalised, int):
                 raise ValueError(f"Attribute '{code}' must be an integer for select")
-        elif attr_meta.get("input", "").lower() in {"boolean", "bool"}:
+        elif input_type in {"boolean", "bool"}:
             if normalised not in {0, 1}:
                 raise ValueError(
                     f"Attribute '{code}' must be normalised to 0 or 1 for boolean fields"
                 )
+
         custom_attributes.append({"attribute_code": code, "value": normalised})
 
-    product: Dict[str, Any] = {
-        "sku": sku,
-        "custom_attributes": custom_attributes,
-        "extension_attributes": {"category_links": category_links},
-    }
+    product: Dict[str, Any] = {"sku": sku, "custom_attributes": custom_attributes}
+    if extension_attributes:
+        product["extension_attributes"] = extension_attributes
 
     return {"product": product}
 
@@ -275,12 +332,28 @@ def apply_product_update(
     attributes: Dict[str, Any],
     metadata: Optional[Dict[str, Dict[str, Any]]] = None,
     payload: Optional[Dict[str, Any]] = None,
+    *,
+    original_attributes: Optional[Dict[str, Any]] = None,
+    original_extension_attributes: Optional[Dict[str, Any]] = None,
 ):
     """Send a Magento product update request for the provided SKU without retries."""
 
     # Always regenerate the payload to ensure fresh normalisation, regardless of
     # whether a pre-built payload has been supplied.
-    final_payload = build_product_payload(sku, attributes, metadata)
+    final_payload = build_product_payload(
+        sku,
+        attributes,
+        metadata,
+        original_attributes=original_attributes,
+        original_extension_attributes=original_extension_attributes,
+    )
+
+    product_payload = final_payload.get("product", {})
+    if st is not None:
+        try:  # pragma: no cover - Streamlit is optional during tests.
+            st.code(json.dumps(product_payload, indent=2))
+        except Exception:
+            pass
 
     logger.info("Sending product update", extra={"sku": sku, "payload": final_payload})
 
@@ -291,13 +364,25 @@ def apply_product_update(
         else:
             response = client.patch(f"products/{sku}", final_payload)
     except httpx.HTTPStatusError as exc:
+        status_code = getattr(exc.response, "status_code", None)
+        request_url = getattr(exc.request, "url", None)
+        request_body = getattr(exc.request, "content", b"")
+        if isinstance(request_body, bytes):
+            try:
+                request_body = request_body.decode("utf-8")
+            except UnicodeDecodeError:
+                request_body = request_body.decode("utf-8", errors="replace")
+        response_text = getattr(exc.response, "text", None)
+
         logger.error(
             "Magento update failed",
             extra={
                 "sku": sku,
                 "payload": final_payload,
-                "status_code": getattr(exc.response, "status_code", None),
-                "response_text": getattr(exc.response, "text", None),
+                "status_code": status_code,
+                "request_url": str(request_url) if request_url is not None else None,
+                "request_body": request_body,
+                "response_text": response_text,
             },
         )
         raise

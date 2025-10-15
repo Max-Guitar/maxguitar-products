@@ -49,7 +49,6 @@ def test_custom_layout_update_file_sentinels_are_dropped(value: str):
         "product": {
             "sku": "SKU123",
             "custom_attributes": [],
-            "extension_attributes": {"category_links": []},
         }
     }
 
@@ -69,9 +68,102 @@ def test_custom_layout_update_file_passes_through_real_path():
                     "value": "Magento/theme/layout.xml",
                 }
             ],
-            "extension_attributes": {"category_links": []},
         }
     }
+
+
+def test_only_changed_attributes_are_sent():
+    payload = build_product_payload(
+        "SKU123",
+        {"options_container": "container2", "color": "5"},
+        {
+            "options_container": {"input": "select"},
+            "color": {"input": "select"},
+        },
+        original_attributes={
+            "options_container": "container2",
+            "color": "4",
+        },
+    )
+
+    assert payload == {
+        "product": {
+            "sku": "SKU123",
+            "custom_attributes": [
+                {"attribute_code": "color", "value": 5},
+            ],
+        }
+    }
+
+
+def test_static_attributes_and_media_are_dropped():
+    payload = build_product_payload(
+        "SKU123",
+        {
+            "has_options": 1,
+            "required_options": 1,
+            "image": "image.jpg",
+            "small_image": "image.jpg",
+            "thumbnail": "image.jpg",
+        },
+    )
+
+    assert payload == {"product": {"sku": "SKU123", "custom_attributes": []}}
+
+
+def test_description_is_sanitised():
+    payload = build_product_payload(
+        "SKU123",
+        {"description": r"Line\\break \\value &amp;"},
+    )
+
+    assert payload == {
+        "product": {
+            "sku": "SKU123",
+            "custom_attributes": [
+                {"attribute_code": "description", "value": "Linebreak value &"},
+            ],
+        }
+    }
+
+
+def test_category_links_are_strings():
+    payload = build_product_payload(
+        "SKU123",
+        {"category_ids": [1, 2]},
+        original_extension_attributes={
+            "category_links": [
+                {"category_id": "1"},
+            ]
+        },
+    )
+
+    assert payload == {
+        "product": {
+            "sku": "SKU123",
+            "custom_attributes": [],
+            "extension_attributes": {
+                "category_links": [
+                    {"category_id": "1"},
+                    {"category_id": "2"},
+                ]
+            },
+        }
+    }
+
+
+def test_category_links_not_sent_when_unchanged():
+    payload = build_product_payload(
+        "SKU123",
+        {"category_ids": [3]},
+        original_extension_attributes={
+            "category_links": [
+                {"category_id": "3"},
+            ]
+        },
+    )
+
+    assert payload == {"product": {"sku": "SKU123", "custom_attributes": []}}
 
 
 def test_apply_product_update_regenerates_payload(monkeypatch: pytest.MonkeyPatch):
@@ -104,6 +196,5 @@ def test_apply_product_update_regenerates_payload(monkeypatch: pytest.MonkeyPatc
         "product": {
             "sku": "SKU123",
             "custom_attributes": [],
-            "extension_attributes": {"category_links": []},
         }
     }
